@@ -6,7 +6,7 @@ const assert = require('assert');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const code = [...html.matchAll(/\/\/ @sim-begin([\s\S]*?)\/\/ @sim-end/g)].map(m => m[1]).join('\n');
-const sim = new Function(code + '\nreturn { CONFIG, createGameState, step, CIRCUIT, createCircuit, circuitQuery };')();
+const sim = new Function(code + '\nreturn { CONFIG, DEFAULT_CONFIG, CONFIG_META, PRESETS, createGameState, step, CIRCUIT, createCircuit, circuitQuery };')();
 
 const DT = 1 / 60;
 const idle = { gas: false, brake: false, left: false, right: false, handbrake: false };
@@ -242,6 +242,38 @@ Object.assign(tests, {
     placeOnCircuit(state, 20, wallLimit() - 60, Math.PI / 2, config.crashSpeed + 150);
     run(state, config, { ...idle, gas: true }, 3);
     assert.strictEqual(state.crashCount, 1);
+  }
+});
+
+// ---- Tuning Panel data ----------------------------------------------------
+Object.assign(tests, {
+  'every CONFIG value has a slider definition with a sensible range, and nothing else does'() {
+    const keys = Object.keys(sim.CONFIG).sort(), meta = Object.keys(sim.CONFIG_META).sort();
+    assert.deepStrictEqual(meta, keys);
+    for (const k of keys) {
+      const m = sim.CONFIG_META[k];
+      assert(['Speed', 'Steering', 'Grip', 'Drift Score'].includes(m.group), k + ' has an unknown group');
+      assert(m.min < m.max && m.step > 0, k + ' has a bad range');
+      assert(sim.DEFAULT_CONFIG[k] >= m.min && sim.DEFAULT_CONFIG[k] <= m.max, k + ' default is outside its slider range');
+    }
+  },
+  'DEFAULT_CONFIG is a frozen copy of the starting CONFIG'() {
+    assert(Object.isFrozen(sim.DEFAULT_CONFIG));
+    assert.deepStrictEqual({ ...sim.DEFAULT_CONFIG }, { ...sim.CONFIG });
+  },
+  'the three presets exist and only set known values inside their slider ranges'() {
+    assert.deepStrictEqual(Object.keys(sim.PRESETS).sort(), ['Arcade', 'Realistic', 'Sideways Mode']);
+    for (const [name, values] of Object.entries(sim.PRESETS)) {
+      for (const [k, v] of Object.entries(values)) {
+        const m = sim.CONFIG_META[k];
+        assert(m, name + ' sets unknown value ' + k);
+        assert(v >= m.min && v <= m.max, `${name}.${k}=${v} is outside its slider range`);
+      }
+    }
+  },
+  'presets rank by sideways grip: Sideways Mode slidiest, Realistic grippiest'() {
+    const g = n => ({ ...sim.DEFAULT_CONFIG, ...sim.PRESETS[n] }).driftGrip;
+    assert(g('Sideways Mode') < g('Arcade') && g('Arcade') < g('Realistic'));
   }
 });
 

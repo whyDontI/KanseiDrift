@@ -32,6 +32,36 @@ const CONFIG = {
   driftScoreRate: 10,     // points per second while drifting (used by scoring)
   comboTimeout: 1.5       // seconds without drifting before the chain ends
 };
+
+// Frozen copy of the starting values, used by the Tuning Panel's Reset and presets.
+const DEFAULT_CONFIG = Object.freeze({ ...CONFIG });
+
+// Slider definitions for the Tuning Panel: one entry per CONFIG value.
+const CONFIG_META = {
+  maxSpeed:          { group: 'Speed',       min: 200,  max: 1200, step: 10 },
+  acceleration:      { group: 'Speed',       min: 100,  max: 1500, step: 10 },
+  brakePower:        { group: 'Speed',       min: 200,  max: 2000, step: 10 },
+  friction:          { group: 'Speed',       min: 0,    max: 3,    step: 0.05 },
+  crashSpeed:        { group: 'Speed',       min: 50,   max: 800,  step: 10 },
+  grassDrag:         { group: 'Speed',       min: 0,    max: 6,    step: 0.1 },
+  wallBounce:        { group: 'Speed',       min: 0,    max: 1,    step: 0.05 },
+  wallScrapeDrag:    { group: 'Speed',       min: 0,    max: 8,    step: 0.1 },
+  crashSpeedKept:    { group: 'Speed',       min: 0.1,  max: 1,    step: 0.05 },
+  steerSpeed:        { group: 'Steering',    min: 0.5,  max: 5,    step: 0.1 },
+  normalGrip:        { group: 'Grip',        min: 1,    max: 20,   step: 0.5 },
+  driftGrip:         { group: 'Grip',        min: 0.2,  max: 15,   step: 0.1 },
+  handbrakeGrip:     { group: 'Grip',        min: 0.1,  max: 10,   step: 0.1 },
+  gripRecoverySpeed: { group: 'Grip',        min: 0.5,  max: 20,   step: 0.5 },
+  driftScoreRate:    { group: 'Drift Score', min: 1,    max: 100,  step: 1 },
+  comboTimeout:      { group: 'Drift Score', min: 0.2,  max: 5,    step: 0.1 }
+};
+
+// Presets only set sliders; anything they leave out goes back to the default.
+const PRESETS = {
+  'Arcade':        { normalGrip: 7,  driftGrip: 3.5, handbrakeGrip: 2,   gripRecoverySpeed: 10, steerSpeed: 2.8, acceleration: 600 },
+  'Realistic':     { normalGrip: 12, driftGrip: 8,   handbrakeGrip: 4,   gripRecoverySpeed: 12, steerSpeed: 2.3 },
+  'Sideways Mode': { normalGrip: 5,  driftGrip: 1.2, handbrakeGrip: 0.6, gripRecoverySpeed: 3,  steerSpeed: 2.9, friction: 0.5, acceleration: 600 }
+};
 // @sim-end
 </script>
 <style>
@@ -40,6 +70,27 @@ const CONFIG = {
   #hud { position: fixed; left: 16px; bottom: 16px; color: #fff; text-shadow: 0 1px 3px #000; pointer-events: none; }
   #hud .big { font-size: 40px; font-weight: 700; }
   #hud .small { font-size: 14px; opacity: .8; }
+  #gear { position: fixed; top: 12px; right: 12px; width: 36px; height: 36px; border-radius: 50%; border: 0;
+    background: rgba(15,18,24,.78); color: #fff; font-size: 20px; line-height: 36px; padding: 0; cursor: pointer; z-index: 11; }
+  #gear:hover { background: rgba(40,46,58,.9); }
+  #panel { position: fixed; top: 58px; right: 12px; width: 270px; max-height: calc(100vh - 80px); display: flex; flex-direction: column;
+    background: rgba(15,18,24,.78); color: #e8eaed; border-radius: 8px; font-size: 12px; z-index: 10; user-select: none; }
+  #panel.hidden { display: none; }
+  #panelTitle { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; cursor: move;
+    font-weight: 700; letter-spacing: .04em; border-bottom: 1px solid rgba(255,255,255,.12); }
+  #panelTitle button { background: none; border: 0; color: inherit; font-size: 16px; cursor: pointer; padding: 0 4px; }
+  #panelBody { overflow-y: auto; padding: 6px 10px 10px; }
+  #panel.collapsed #panelBody { display: none; }
+  #panel h4 { margin: 10px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #8ecae6; }
+  #panel .row { margin: 4px 0; }
+  #panel .row .top { display: flex; justify-content: space-between; }
+  #panel .row .val { font-variant-numeric: tabular-nums; color: #fff; }
+  #panel input[type=range] { width: 100%; margin: 2px 0 0; }
+  #panel .actions { display: flex; gap: 6px; margin-top: 10px; }
+  #panel .actions button, #panel select { flex: 1; background: rgba(255,255,255,.12); color: #fff; border: 1px solid rgba(255,255,255,.2);
+    border-radius: 4px; padding: 5px 6px; font-size: 12px; cursor: pointer; }
+  #panel select { width: 100%; margin-top: 8px; flex: none; }
+  #panel select option { color: #000; }
 </style>
 </head>
 <body>
@@ -385,8 +436,153 @@ camera.x = game.car.x; camera.y = game.car.y;
 requestAnimationFrame(frame);
 
 /* ==================================================================
-   TUNING PANEL - added in a later ticket.
+   TUNING PANEL - HTML/CSS overlay with one slider per CONFIG value.
+   Moving a slider changes CONFIG at once, so the game reacts instantly.
    ================================================================== */
+(function initTuningPanel() {
+  const TUNING_KEY = 'drift.tuning.v1';   // slider values
+  const PANEL_KEY = 'drift.panel.v1';     // panel open state and position
+  const GROUPS = ['Speed', 'Steering', 'Grip', 'Drift Score'];
+
+  function loadJSON(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
+  function saveJSON(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* storage unavailable */ } }
+  function el(tag, props = {}, children = []) {
+    const node = Object.assign(document.createElement(tag), props);
+    for (const c of children) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    return node;
+  }
+  const decimalsOf = step => (String(step).split('.')[1] || '').length;
+  const tidy = (key, v) => Number(v.toFixed(decimalsOf(CONFIG_META[key].step) + 2));
+
+  // Restore saved slider values (ignoring anything unknown or out of range).
+  const saved = loadJSON(TUNING_KEY);
+  if (saved && typeof saved === 'object') {
+    for (const key in CONFIG_META) {
+      const v = saved[key], m = CONFIG_META[key];
+      if (typeof v === 'number' && isFinite(v)) CONFIG[key] = clamp(v, m.min, m.max);
+    }
+  }
+  const saveTuning = () => saveJSON(TUNING_KEY, CONFIG);
+
+  // ---- Build the panel ----
+  const gear = el('button', { id: 'gear', type: 'button', title: 'Tuning panel (H)', textContent: '\u2699' });
+  const collapseBtn = el('button', { type: 'button', title: 'Collapse', textContent: '\u2212' });
+  const title = el('div', { id: 'panelTitle' }, [el('span', { textContent: 'TUNING' }), collapseBtn]);
+  const body = el('div', { id: 'panelBody' });
+  const panel = el('div', { id: 'panel' }, [title, body]);
+  const sliders = {};   // key -> { input, value }
+
+  for (const group of GROUPS) {
+    body.appendChild(el('h4', { textContent: group }));
+    for (const key in CONFIG_META) {
+      const m = CONFIG_META[key];
+      if (m.group !== group) continue;
+      const decimals = decimalsOf(m.step);
+      const input = el('input', { type: 'range', min: m.min, max: m.max, step: m.step, value: CONFIG[key] });
+      const value = el('span', { className: 'val', textContent: CONFIG[key].toFixed(decimals) });
+      body.appendChild(el('div', { className: 'row' }, [el('div', { className: 'top' }, [el('span', { textContent: key }), value]), input]));
+      sliders[key] = { input, value, decimals };
+      input.addEventListener('input', () => {
+        CONFIG[key] = tidy(key, Number(input.value));
+        value.textContent = CONFIG[key].toFixed(decimals);
+        presetSelect.value = '';
+        saveTuning();
+      });
+      // Blur after a click or drag so the arrow keys keep driving the car.
+      input.addEventListener('change', () => input.blur());
+      input.addEventListener('pointerup', () => input.blur());
+    }
+  }
+
+  function showValues() {
+    for (const key in sliders) {
+      const s = sliders[key];
+      s.input.value = CONFIG[key];
+      s.value.textContent = CONFIG[key].toFixed(s.decimals);
+    }
+  }
+
+  const presetSelect = el('select', {}, [el('option', { value: '', textContent: 'Presets\u2026' }),
+    ...Object.keys(PRESETS).map(name => el('option', { value: name, textContent: name }))]);
+  presetSelect.addEventListener('change', () => {
+    const preset = PRESETS[presetSelect.value];
+    if (preset) { Object.assign(CONFIG, DEFAULT_CONFIG, preset); showValues(); saveTuning(); }
+    presetSelect.blur();
+  });
+
+  const resetBtn = el('button', { type: 'button', textContent: 'Reset' });
+  resetBtn.addEventListener('click', () => {
+    Object.assign(CONFIG, DEFAULT_CONFIG);
+    presetSelect.value = '';
+    showValues(); saveTuning(); resetBtn.blur();
+  });
+
+  const copyBtn = el('button', { type: 'button', textContent: 'Copy Config' });
+  copyBtn.addEventListener('click', () => {
+    const text = '{\n' + Object.keys(CONFIG_META).map(k => '  ' + k + ': ' + CONFIG[k]).join(',\n') + '\n}';
+    const done = () => { copyBtn.textContent = 'Copied!'; setTimeout(() => { copyBtn.textContent = 'Copy Config'; }, 1200); };
+    const fallback = () => {   // clipboard API needs a secure page; double-clicked files are not
+      const ta = el('textarea', { value: text });
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (e) { /* nothing more to try */ }
+      ta.remove();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback);
+    else fallback();
+    copyBtn.blur();
+  });
+
+  body.appendChild(presetSelect);
+  body.appendChild(el('div', { className: 'actions' }, [resetBtn, copyBtn]));
+  document.body.appendChild(panel);
+  document.body.appendChild(gear);
+
+  // ---- Open, collapse, drag, remember ----
+  const ui = Object.assign({ open: true, collapsed: false, left: null, top: null }, loadJSON(PANEL_KEY));
+  const saveUI = () => saveJSON(PANEL_KEY, ui);
+  function applyUI() {
+    panel.classList.toggle('hidden', !ui.open);
+    panel.classList.toggle('collapsed', ui.collapsed);
+    collapseBtn.textContent = ui.collapsed ? '+' : '\u2212';
+    if (typeof ui.left === 'number' && typeof ui.top === 'number') {
+      panel.style.right = 'auto';
+      panel.style.left = clamp(ui.left, 0, Math.max(0, window.innerWidth - 60)) + 'px';
+      panel.style.top = clamp(ui.top, 0, Math.max(0, window.innerHeight - 40)) + 'px';
+    }
+  }
+  function togglePanel() { ui.open = !ui.open; applyUI(); saveUI(); }
+  applyUI();
+
+  gear.addEventListener('click', () => { togglePanel(); gear.blur(); });
+  collapseBtn.addEventListener('click', () => { ui.collapsed = !ui.collapsed; applyUI(); saveUI(); collapseBtn.blur(); });
+  window.addEventListener('keydown', e => {
+    if (e.code !== 'KeyH' || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+    e.preventDefault();                       // H must not type or move anything else
+    togglePanel();
+    if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+  });
+
+  let drag = null;
+  title.addEventListener('pointerdown', e => {
+    if (e.target === collapseBtn) return;
+    const r = panel.getBoundingClientRect();
+    drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    title.setPointerCapture(e.pointerId);
+  });
+  title.addEventListener('pointermove', e => {
+    if (!drag) return;
+    ui.left = e.clientX - drag.dx; ui.top = e.clientY - drag.dy;
+    applyUI();
+  });
+  title.addEventListener('pointerup', () => { if (drag) { drag = null; saveUI(); } });
+
+  // Clicks and wheel on the panel never reach the game.
+  for (const node of [panel, gear]) {
+    for (const type of ['pointerdown', 'mousedown', 'click', 'dblclick', 'contextmenu', 'wheel']) {
+      node.addEventListener(type, e => e.stopPropagation());
+    }
+  }
+})();
 </script>
 </body>
 </html>
