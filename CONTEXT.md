@@ -35,12 +35,16 @@ _Avoid_: Points (points are the pending amount within a chain)
 ### Track
 
 **Circuit**:
-The fixed, hand-authored closed loop of road bounded by walls, with grass outside the road.
+The fixed, hand-authored closed loop of road, with a grass Verge on each side, bounded by Walls.
 _Avoid_: Course, map
 
 **Wall**:
-The boundary at the road's edge that the car collides with.
+The boundary enclosing the Circuit, standing just beyond the grass verge that borders the road; the car collides with it.
 _Avoid_: Barrier, fence
+
+**Verge**:
+The strip of grass between the road edge and the Wall; driving on it slows the car.
+_Avoid_: Shoulder, off-road
 
 **Scrape**:
 A low-speed or glancing wall hit that only slows the car and keeps the Drift Chain alive.
