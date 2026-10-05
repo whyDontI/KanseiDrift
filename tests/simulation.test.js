@@ -6,14 +6,24 @@ const assert = require('assert');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const code = [...html.matchAll(/\/\/ @sim-begin([\s\S]*?)\/\/ @sim-end/g)].map(m => m[1]).join('\n');
-const sim = new Function(code + '\nreturn { CONFIG, createGameState, step };')();
+const sim = new Function(code + '\nreturn { CONFIG, createGameState, step, CIRCUIT, createCircuit, circuitQuery };')();
 
 const DT = 1 / 60;
 const idle = { gas: false, brake: false, left: false, right: false, handbrake: false };
 
-function fresh(overrides = {}) {
+// Physics tests run on open ground: a circuit so large the car never meets a Wall.
+const OPEN_GROUND = sim.createCircuit(
+  Array.from({ length: 12 }, (_, i) => ({ x: 1e6 * Math.cos(i / 12 * 2 * Math.PI), y: 1e6 * Math.sin(i / 12 * 2 * Math.PI) })),
+  1e5, 1e5, 4);
+function fresh(overrides = {}, onRealCircuit = false) {
   const config = { ...sim.CONFIG, ...overrides };
-  return { config, state: sim.createGameState(config) };
+  const state = sim.createGameState(config);
+  if (!onRealCircuit) {
+    state.circuit = OPEN_GROUND;
+    state.car.x = OPEN_GROUND.start.x; state.car.y = OPEN_GROUND.start.y;
+    state.car.heading = Math.atan2(OPEN_GROUND.start.ty, OPEN_GROUND.start.tx);
+  }
+  return { config, state };
 }
 function run(state, config, inp, seconds, dt = DT) {
   for (let t = 0; t < seconds - 1e-9; t += dt) sim.step(state, inp, dt, config);
@@ -112,6 +122,128 @@ const tests = {
     assert(Math.hypot(a.x - b.x, a.y - b.y) < 40, 'positions should match');
   }
 };
+
+// ---- Circuit, Walls and grass -------------------------------------------
+// Put the car on the centreline at sample `i`, offset sideways by `offset`, with given local velocity.
+function placeOnCircuit(state, i, offset, headingRelative, fwd, lat = 0) {
+  const c = sim.CIRCUIT, p = c.pts[i], q = c.pts[(i + 1) % c.pts.length];
+  const tx = q.x - p.x, ty = q.y - p.y, len = Math.hypot(tx, ty);
+  const ux = tx / len, uy = ty / len;           // along the road
+  const nx = -uy, ny = ux;                      // sideways (left of travel)
+  const car = state.car;
+  car.x = p.x + nx * offset; car.y = p.y + ny * offset;
+  car.heading = Math.atan2(uy, ux) + headingRelative;
+  const hx = Math.cos(car.heading), hy = Math.sin(car.heading);
+  car.vx = hx * fwd - hy * lat; car.vy = hy * fwd + hx * lat;
+  car.grip = state.config ? state.config.normalGrip : sim.CONFIG.normalGrip;
+  return { nx, ny, ux, uy };
+}
+const dist = car => sim.circuitQuery(sim.CIRCUIT, car.x, car.y).dist;
+const wallLimit = () => sim.CIRCUIT.halfWall;
+
+Object.assign(tests, {
+  'the circuit is a closed loop wide enough that its walls never overlap or pinch'() {
+    const pts = sim.CIRCUIT.pts, n = pts.length, outer = sim.CIRCUIT.halfWall + 10;
+    for (let i = 0; i < n; i++) {                       // no corner tighter than the wall radius
+      const a = pts[i], b = pts[(i + 1) % n], c = pts[(i + 2) % n];
+      const ab = Math.hypot(b.x - a.x, b.y - a.y), bc = Math.hypot(c.x - b.x, c.y - b.y), ca = Math.hypot(a.x - c.x, a.y - c.y);
+      const area2 = Math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y));
+      const radius = area2 < 1e-9 ? Infinity : (ab * bc * ca) / (2 * area2);
+      assert(radius >= outer, `corner ${i} radius ${radius.toFixed(0)} < ${outer}`);
+    }
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {   // separate stretches stay apart
+      if (Math.min(j - i, n - (j - i)) < 24) continue;
+      const d = Math.hypot(pts[i].x - pts[j].x, pts[i].y - pts[j].y);
+      assert(d >= 2 * outer, `stretches ${i} and ${j} only ${d.toFixed(0)} apart`);
+    }
+  },
+  'the car spawns on the road, behind the start line, facing forward'() {
+    const { state } = fresh({}, true), car = state.car, c = sim.CIRCUIT;
+    assert(sim.circuitQuery(c, car.x, car.y).dist < c.halfRoad * 0.2, 'should start near the centreline');
+    const ahead = (c.start.x - car.x) * c.start.tx + (c.start.y - car.y) * c.start.ty;
+    assert(ahead > 20, 'start line should be ahead of the car');
+    assert(Math.cos(car.heading) * c.start.tx + Math.sin(car.heading) * c.start.ty > 0.99, 'should face along the road');
+  },
+  'on the road the surface is road and on the verge it is grass'() {
+    const { config, state } = fresh({}, true);
+    sim.step(state, idle, DT, config);
+    assert.strictEqual(state.car.surface, 'road');
+    placeOnCircuit(state, 5, sim.CIRCUIT.halfRoad + 20, 0, 0);
+    sim.step(state, idle, DT, config);
+    assert.strictEqual(state.car.surface, 'grass');
+  },
+  'grass slows the car more than road, and grassDrag controls how much'() {
+    const coast = (offset, grassDrag) => {
+      const { config, state } = fresh({ grassDrag }, true);
+      placeOnCircuit(state, 5, offset, 0, 300);
+      run(state, config, idle, 0.4);
+      return localSpeeds(state.car).fwd;
+    };
+    const road = coast(0, 2), grass = coast(sim.CIRCUIT.halfRoad + 15, 2);
+    assert(grass < road * 0.8, 'grass should slow the car');
+    assert(coast(sim.CIRCUIT.halfRoad + 15, 0) > coast(sim.CIRCUIT.halfRoad + 15, 4), 'bigger grassDrag, slower car');
+  },
+  'a low-speed wall hit is a Scrape: it slows the car but is not a Crash'() {
+    const { config, state } = fresh({}, true);
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.PI / 2, 120);
+    run(state, config, idle, 1);
+    assert.strictEqual(state.lastImpact.type, 'scrape');
+    assert.strictEqual(state.crashCount, 0);
+  },
+  'a hard head-on wall hit above crashSpeed is a Crash'() {
+    const { config, state } = fresh({}, true);
+    placeOnCircuit(state, 20, wallLimit() - 60, Math.PI / 2, config.crashSpeed + 150);
+    run(state, config, idle, 0.5);
+    assert.strictEqual(state.lastImpact.type, 'crash');
+    assert.strictEqual(state.crashCount, 1);
+  },
+  'a fast glancing hit is a Scrape because the impact along the wall normal is small'() {
+    const { config, state } = fresh({}, true);
+    // Aimed a few degrees at the wall: about 500 along it, about 100 into it.
+    placeOnCircuit(state, 20, wallLimit() - 30, Math.atan2(100, 500), Math.hypot(500, 100));
+    run(state, config, idle, 0.5);
+    assert.strictEqual(state.crashCount, 0);
+    assert.strictEqual(state.lastImpact.type, 'scrape');
+  },
+  'both a Scrape and a Crash slow the car'() {
+    for (const inward of [120, 500]) {
+      const { config, state } = fresh({}, true);
+      placeOnCircuit(state, 20, wallLimit() - 30, Math.atan2(inward, 400), Math.hypot(400, inward));
+      const car = state.car, before = Math.hypot(car.vx, car.vy);
+      run(state, config, idle, 0.6);
+      assert(Math.hypot(car.vx, car.vy) < before * 0.8, `inward ${inward} should have slowed the car`);
+    }
+  },
+  'the car can never leave the Circuit through a Wall'() {
+    const { config, state } = fresh({}, true);
+    placeOnCircuit(state, 40, 0, Math.PI / 2, 0);
+    let worst = 0;
+    for (let t = 0; t < 8; t += DT) {
+      sim.step(state, { ...idle, gas: true }, DT, config);
+      worst = Math.max(worst, dist(state.car));
+    }
+    assert(worst <= wallLimit(), `car reached ${worst.toFixed(1)} from the centreline, wall is at ${wallLimit()}`);
+    assert(state.lastImpact, 'should have hit the wall');
+  },
+  'a gentle graze is not recorded, and a Crash right after a Scrape still counts'() {
+    const { config, state } = fresh({}, true);
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.atan2(20, 300), Math.hypot(300, 20));
+    run(state, config, idle, 0.4);
+    assert.strictEqual(state.lastImpact, null, 'a 20 px/s touch should not register');
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.PI / 2, 120);
+    run(state, config, idle, 0.4);
+    assert.strictEqual(state.lastImpact.type, 'scrape');
+    placeOnCircuit(state, 20, wallLimit() - 25, Math.PI / 2, config.crashSpeed + 150);
+    run(state, config, idle, 0.15);
+    assert.strictEqual(state.crashCount, 1, 'a hard hit straight after a Scrape must be a Crash');
+  },
+  'a Crash is only counted once per impact, not every frame'() {
+    const { config, state } = fresh({}, true);
+    placeOnCircuit(state, 20, wallLimit() - 60, Math.PI / 2, config.crashSpeed + 150);
+    run(state, config, { ...idle, gas: true }, 3);
+    assert.strictEqual(state.crashCount, 1);
+  }
+});
 
 let failed = 0;
 for (const [name, fn] of Object.entries(tests)) {

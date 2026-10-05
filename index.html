@@ -16,6 +16,11 @@ const CONFIG = {
   acceleration: 520,      // how fast gas adds speed (px/s per second)
   brakePower: 950,        // how hard brake slows you down (px/s per second)
   friction: 0.7,          // rolling drag: share of speed lost per second with no gas
+  crashSpeed: 260,        // speed into a wall (px/s) above which a hit is a Crash, not a Scrape
+  grassDrag: 1.6,         // extra drag per second while the car is mostly on grass
+  wallBounce: 0.2,        // share of the speed into a wall that bounces back
+  wallScrapeDrag: 2.5,    // speed lost per second while rubbing along a wall
+  crashSpeedKept: 0.55,   // share of speed the car keeps after a Crash
   // --- Steering ---
   steerSpeed: 2.6,        // turn rate in radians per second at full lock
   // --- Grip ---
@@ -139,6 +144,88 @@ function stepCar(car, inp, dt, config) {
   car.x += car.vx * dt;
   car.y += car.vy * dt;
 }
+
+/* The Circuit: a closed centreline (smoothed through the control points), a constant road
+   width, and a grass verge on each side. The Wall stands at the outer edge of the verge. */
+const TRACK_CONTROLS = [
+  { x: 0, y: -700 }, { x: 900, y: -600 }, { x: 1500, y: -250 }, { x: 1450, y: 300 },
+  { x: 900, y: 550 }, { x: 150, y: 300 }, { x: -300, y: 600 }, { x: -700, y: 800 },
+  { x: -1300, y: 500 }, { x: -1450, y: -100 }, { x: -1300, y: -500 }, { x: -800, y: -600 }
+];
+const ROAD_WIDTH = 220;        // width of the tarmac in pixels
+const VERGE_WIDTH = 60;        // grass between the road edge and the Wall
+const TRACK_SAMPLES = 16;      // centreline points generated per control segment
+const START_SETBACK = 80;      // how far behind the start line the car spawns
+const CAR_RADIUS = 18;         // the car's collision circle
+const IMPACT_MIN_SPEED = 40;   // wall speed (px/s) below which a touch is not worth counting
+
+function createCircuit(controls, roadWidth, vergeWidth, samples) {
+  const pts = [], n = controls.length;
+  for (let i = 0; i < n; i++) {
+    const p0 = controls[(i + n - 1) % n], p1 = controls[i], p2 = controls[(i + 1) % n], p3 = controls[(i + 2) % n];
+    for (let k = 0; k < samples; k++) {
+      const t = k / samples, t2 = t * t, t3 = t2 * t;
+      const spline = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+      pts.push({ x: spline(p0.x, p1.x, p2.x, p3.x), y: spline(p0.y, p1.y, p2.y, p3.y) });
+    }
+  }
+  const a = pts[pts.length - 1], b = pts[1], len = Math.hypot(b.x - a.x, b.y - a.y);
+  return {
+    pts, halfRoad: roadWidth / 2, halfWall: roadWidth / 2 + vergeWidth,
+    start: { x: pts[0].x, y: pts[0].y, tx: (b.x - a.x) / len, ty: (b.y - a.y) / len }
+  };
+}
+const CIRCUIT = createCircuit(TRACK_CONTROLS, ROAD_WIDTH, VERGE_WIDTH, TRACK_SAMPLES);
+
+// Nearest point on the centreline to (x, y), and the unit vector from it to the car.
+function circuitQuery(circuit, x, y) {
+  const pts = circuit.pts, n = pts.length;
+  let best = Infinity, cx = 0, cy = 0, bestIndex = 0;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const abx = b.x - a.x, aby = b.y - a.y;
+    const t = clamp(((x - a.x) * abx + (y - a.y) * aby) / (abx * abx + aby * aby), 0, 1);
+    const px = a.x + abx * t, py = a.y + aby * t;
+    const d2 = (x - px) * (x - px) + (y - py) * (y - py);
+    if (d2 < best) { best = d2; cx = px; cy = py; bestIndex = i; }
+  }
+  const dist = Math.sqrt(best);
+  let nx = 0, ny = 1;
+  if (dist > 1e-6) { nx = (x - cx) / dist; ny = (y - cy) / dist; }
+  return { dist, nx, ny, cx, cy, index: bestIndex };
+}
+
+function scaleVelocity(car, factor) { car.vx *= factor; car.vy *= factor; }
+
+// Grass slows the car whenever it is mostly off the tarmac.
+function applyGrass(car, circuit, dt, config) {
+  const nearest = circuitQuery(circuit, car.x, car.y);
+  car.surface = nearest.dist + CAR_RADIUS * 0.5 > circuit.halfRoad ? 'grass' : 'road';
+  if (car.surface === 'grass') scaleVelocity(car, Math.exp(-config.grassDrag * dt));
+}
+
+// The Wall stops the car. A hit with speed into the Wall above crashSpeed is a Crash,
+// anything gentler (or glancing) is a Scrape. Both slow the car; touches under
+// IMPACT_MIN_SPEED just rub without being recorded.
+function collideWithWall(state, dt, config) {
+  const car = state.car, circuit = state.circuit;
+  const nearest = circuitQuery(circuit, car.x, car.y);
+  const limit = circuit.halfWall - CAR_RADIUS;
+  if (nearest.dist <= limit) return;
+  car.x = nearest.cx + nearest.nx * limit;      // push back inside
+  car.y = nearest.cy + nearest.ny * limit;
+  const intoWall = car.vx * nearest.nx + car.vy * nearest.ny;
+  if (intoWall > 0) {
+    car.vx -= (1 + config.wallBounce) * intoWall * nearest.nx;
+    car.vy -= (1 + config.wallBounce) * intoWall * nearest.ny;
+  }
+  scaleVelocity(car, Math.exp(-config.wallScrapeDrag * dt));
+  if (intoWall < IMPACT_MIN_SPEED) return;
+  const crash = intoWall > config.crashSpeed;
+  if (crash) { scaleVelocity(car, config.crashSpeedKept); state.crashCount++; }
+  else state.scrapeCount++;
+  state.lastImpact = { type: crash ? 'crash' : 'scrape', speed: intoWall, time: state.time };
+}
 // @sim-end
 
 /* ==================================================================
@@ -146,12 +233,17 @@ function stepCar(car, inp, dt, config) {
    ================================================================== */
 // @sim-begin
 function createGameState(config) {
-  return { time: 0, car: createCarState(config, 0, 0, -Math.PI / 2) };
+  const c = CIRCUIT.start;
+  const car = createCarState(config, c.x - c.tx * START_SETBACK, c.y - c.ty * START_SETBACK, Math.atan2(c.ty, c.tx));
+  car.surface = 'road';       // 'road' or 'grass'
+  return { time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0 };
 }
 
 // Advance the whole game by dt seconds.
 function step(state, inp, dt, config) {
   stepCar(state.car, inp, dt, config);
+  applyGrass(state.car, state.circuit, dt, config);
+  collideWithWall(state, dt, config);
   state.time += dt;
 }
 // @sim-end
@@ -170,6 +262,7 @@ const camera = { x: 0, y: 0 };
 const CAMERA_LOOKAHEAD = 0.3;   // seconds of velocity the camera leads by
 const CAMERA_STIFFNESS = 5;     // how tightly the camera follows (higher = snappier)
 const TILE = 200;
+const WALL_THICKNESS = 10;  // how thick the Wall is drawn (looks only)
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -202,6 +295,47 @@ function drawGround(w, h) {
   }
 }
 
+function tracePath(pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.closePath();
+}
+
+// Wall, grass verge, road, centre dashes and the start/finish line.
+function drawCircuit() {
+  const c = game.circuit, pts = c.pts;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  tracePath(pts);
+  ctx.strokeStyle = '#e8e8e8';                        // Wall
+  ctx.lineWidth = (c.halfWall + WALL_THICKNESS) * 2;
+  ctx.stroke();
+  ctx.strokeStyle = '#3f8a3f';                        // grass verge
+  ctx.lineWidth = c.halfWall * 2;
+  ctx.stroke();
+  ctx.strokeStyle = '#4a4d52';                        // road
+  ctx.lineWidth = c.halfRoad * 2;
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';         // centre dashes
+  ctx.lineWidth = 4;
+  ctx.setLineDash([40, 40]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  const st = c.start;                                 // start/finish line
+  ctx.save();
+  ctx.translate(st.x, st.y);
+  ctx.rotate(Math.atan2(st.ty, st.tx));
+  const cell = 14, rows = Math.ceil(c.halfRoad * 2 / cell);
+  for (let r = 0; r < rows; r++) {
+    for (let k = 0; k < 2; k++) {
+      ctx.fillStyle = (r + k) & 1 ? '#fff' : '#111';
+      ctx.fillRect(k * cell - cell, -c.halfRoad + r * cell, cell, cell);
+    }
+  }
+  ctx.restore();
+}
+
 function drawCar() {
   const car = game.car;
   ctx.save();
@@ -227,6 +361,7 @@ function render() {
   ctx.save();
   ctx.translate(w / 2 - camera.x, h / 2 - camera.y);
   drawGround(w, h);
+  drawCircuit();
   drawCar();
   ctx.restore();
   const speed = Math.hypot(game.car.vx, game.car.vy);
