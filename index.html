@@ -33,6 +33,7 @@ const CONFIG = {
   comboTimeout: 1.5       // seconds without drifting before the chain ends
 };
 
+// ---- Tuning Panel data (kept here, DOM-free, so the tests can reach it) ----
 // Frozen copy of the starting values, used by the Tuning Panel's Reset and presets.
 const DEFAULT_CONFIG = Object.freeze({ ...CONFIG });
 
@@ -452,7 +453,9 @@ requestAnimationFrame(frame);
     return node;
   }
   const decimalsOf = step => (String(step).split('.')[1] || '').length;
-  const tidy = (key, v) => Number(v.toFixed(decimalsOf(CONFIG_META[key].step) + 2));
+  // Round to a little more than the slider step, so float noise like 0.30000000000000004 never shows.
+  const roundToStep = (key, v) => Number(v.toFixed(decimalsOf(CONFIG_META[key].step) + 2));
+  const dropFocus = node => node.blur();   // so the arrow keys go back to driving the car
 
   // Restore saved slider values (ignoring anything unknown or out of range).
   const saved = loadJSON(TUNING_KEY);
@@ -483,14 +486,14 @@ requestAnimationFrame(frame);
       body.appendChild(el('div', { className: 'row' }, [el('div', { className: 'top' }, [el('span', { textContent: key }), value]), input]));
       sliders[key] = { input, value, decimals };
       input.addEventListener('input', () => {
-        CONFIG[key] = tidy(key, Number(input.value));
+        CONFIG[key] = roundToStep(key, Number(input.value));
         value.textContent = CONFIG[key].toFixed(decimals);
         presetSelect.value = '';
         saveTuning();
       });
       // Blur after a click or drag so the arrow keys keep driving the car.
-      input.addEventListener('change', () => input.blur());
-      input.addEventListener('pointerup', () => input.blur());
+      input.addEventListener('change', () => dropFocus(input));
+      input.addEventListener('pointerup', () => dropFocus(input));
     }
   }
 
@@ -507,29 +510,33 @@ requestAnimationFrame(frame);
   presetSelect.addEventListener('change', () => {
     const preset = PRESETS[presetSelect.value];
     if (preset) { Object.assign(CONFIG, DEFAULT_CONFIG, preset); showValues(); saveTuning(); }
-    presetSelect.blur();
+    dropFocus(presetSelect);
   });
 
   const resetBtn = el('button', { type: 'button', textContent: 'Reset' });
   resetBtn.addEventListener('click', () => {
     Object.assign(CONFIG, DEFAULT_CONFIG);
     presetSelect.value = '';
-    showValues(); saveTuning(); resetBtn.blur();
+    showValues(); saveTuning(); dropFocus(resetBtn);
   });
 
   const copyBtn = el('button', { type: 'button', textContent: 'Copy Config' });
   copyBtn.addEventListener('click', () => {
     const text = '{\n' + Object.keys(CONFIG_META).map(k => '  ' + k + ': ' + CONFIG[k]).join(',\n') + '\n}';
     const done = () => { copyBtn.textContent = 'Copied!'; setTimeout(() => { copyBtn.textContent = 'Copy Config'; }, 1200); };
+    const failed = () => { copyBtn.textContent = 'Copy failed'; setTimeout(() => { copyBtn.textContent = 'Copy Config'; }, 1500); };
     const fallback = () => {   // clipboard API needs a secure page; double-clicked files are not
       const ta = el('textarea', { value: text });
+      ta.style.cssText = 'position:fixed;left:-9999px;opacity:0';
       document.body.appendChild(ta); ta.select();
-      try { document.execCommand('copy'); done(); } catch (e) { /* nothing more to try */ }
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { /* ok stays false */ }
       ta.remove();
+      if (ok) done(); else failed();
     };
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback);
     else fallback();
-    copyBtn.blur();
+    dropFocus(copyBtn);
   });
 
   body.appendChild(presetSelect);
@@ -538,23 +545,23 @@ requestAnimationFrame(frame);
   document.body.appendChild(gear);
 
   // ---- Open, collapse, drag, remember ----
-  const ui = Object.assign({ open: true, collapsed: false, left: null, top: null }, loadJSON(PANEL_KEY));
-  const saveUI = () => saveJSON(PANEL_KEY, ui);
+  const panelState = Object.assign({ open: true, collapsed: false, left: null, top: null }, loadJSON(PANEL_KEY));
+  const saveUI = () => saveJSON(PANEL_KEY, panelState);
   function applyUI() {
-    panel.classList.toggle('hidden', !ui.open);
-    panel.classList.toggle('collapsed', ui.collapsed);
-    collapseBtn.textContent = ui.collapsed ? '+' : '\u2212';
-    if (typeof ui.left === 'number' && typeof ui.top === 'number') {
+    panel.classList.toggle('hidden', !panelState.open);
+    panel.classList.toggle('collapsed', panelState.collapsed);
+    collapseBtn.textContent = panelState.collapsed ? '+' : '\u2212';
+    if (typeof panelState.left === 'number' && typeof panelState.top === 'number') {
       panel.style.right = 'auto';
-      panel.style.left = clamp(ui.left, 0, Math.max(0, window.innerWidth - 60)) + 'px';
-      panel.style.top = clamp(ui.top, 0, Math.max(0, window.innerHeight - 40)) + 'px';
+      panel.style.left = clamp(panelState.left, 0, Math.max(0, window.innerWidth - 60)) + 'px';
+      panel.style.top = clamp(panelState.top, 0, Math.max(0, window.innerHeight - 40)) + 'px';
     }
   }
-  function togglePanel() { ui.open = !ui.open; applyUI(); saveUI(); }
+  function togglePanel() { panelState.open = !panelState.open; applyUI(); saveUI(); }
   applyUI();
 
-  gear.addEventListener('click', () => { togglePanel(); gear.blur(); });
-  collapseBtn.addEventListener('click', () => { ui.collapsed = !ui.collapsed; applyUI(); saveUI(); collapseBtn.blur(); });
+  gear.addEventListener('click', () => { togglePanel(); dropFocus(gear); });
+  collapseBtn.addEventListener('click', () => { panelState.collapsed = !panelState.collapsed; applyUI(); saveUI(); dropFocus(collapseBtn); });
   window.addEventListener('keydown', e => {
     if (e.code !== 'KeyH' || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
     e.preventDefault();                       // H must not type or move anything else
@@ -571,10 +578,18 @@ requestAnimationFrame(frame);
   });
   title.addEventListener('pointermove', e => {
     if (!drag) return;
-    ui.left = e.clientX - drag.dx; ui.top = e.clientY - drag.dy;
+    panelState.left = clamp(e.clientX - drag.dx, 0, Math.max(0, window.innerWidth - 60));
+    panelState.top = clamp(e.clientY - drag.dy, 0, Math.max(0, window.innerHeight - 40));
     applyUI();
   });
-  title.addEventListener('pointerup', () => { if (drag) { drag = null; saveUI(); } });
+  const endDrag = () => { if (drag) { drag = null; saveUI(); } };
+  title.addEventListener('pointerup', endDrag);
+  title.addEventListener('pointercancel', endDrag);
+  title.addEventListener('lostpointercapture', endDrag);
+  window.addEventListener('resize', applyUI);   // keeps a dragged panel on screen
+
+  // Moving focus into the panel must never leave a driving key stuck on.
+  panel.addEventListener('focusin', () => { for (const k in input) input[k] = false; });
 
   // Clicks and wheel on the panel never reach the game.
   for (const node of [panel, gear]) {
