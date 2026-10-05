@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Drift</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+/* ==================================================================
+   CONFIG - every handling number lives here. Physics reads these
+   every frame, so changing a value takes effect immediately.
+   ================================================================== */
+// @sim-begin
+const CONFIG = {
+  // --- Speed ---
+  maxSpeed: 620,          // top forward speed in pixels per second
+  acceleration: 520,      // how fast gas adds speed (px/s per second)
+  brakePower: 950,        // how hard brake slows you down (px/s per second)
+  friction: 0.7,          // rolling drag: share of speed lost per second with no gas
+  // --- Steering ---
+  steerSpeed: 2.6,        // turn rate in radians per second at full lock
+  // --- Grip ---
+  normalGrip: 9,          // sideways grip while driving normally (higher = stickier)
+  driftGrip: 4.5,         // sideways grip when steering hard at speed (lower = slidier)
+  handbrakeGrip: 2.5,     // sideways grip while Space is held
+  gripRecoverySpeed: 8,   // how fast grip returns once you straighten up (per second)
+  // --- Drift Score ---
+  driftScoreRate: 10,     // points per second while drifting (used by scoring)
+  comboTimeout: 1.5       // seconds without drifting before the chain ends
+};
+// @sim-end
+</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #2f6b2f; font-family: system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; left: 16px; bottom: 16px; color: #fff; text-shadow: 0 1px 3px #000; pointer-events: none; }
+  #hud .big { font-size: 40px; font-weight: 700; }
+  #hud .small { font-size: 14px; opacity: .8; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud"><div><span class="big" id="hudSpeed">0</span> <span class="small">km/h</span></div></div>
+
+<script>
+/* ==================================================================
+   INPUT - keyboard state. Driving keys never scroll the page.
+   ================================================================== */
+const input = { gas: false, brake: false, left: false, right: false, handbrake: false };
+const KEY_MAP = {
+  KeyW: 'gas', ArrowUp: 'gas',
+  KeyS: 'brake', ArrowDown: 'brake',
+  KeyA: 'left', ArrowLeft: 'left',
+  KeyD: 'right', ArrowRight: 'right',
+  Space: 'handbrake'
+};
+window.addEventListener('keydown', e => {
+  const k = KEY_MAP[e.code];
+  if (!k) return;
+  e.preventDefault();
+  input[k] = true;
+});
+window.addEventListener('keyup', e => {
+  const k = KEY_MAP[e.code];
+  if (!k) return;
+  e.preventDefault();
+  input[k] = false;
+});
+window.addEventListener('blur', () => { for (const k in input) input[k] = false; });
+
+/* ==================================================================
+   PHYSICS - DOM-free. Velocity, heading and sideways grip.
+   Everything between the @sim markers can be run headlessly by tests.
+   ================================================================== */
+// @sim-begin
+const GRIP_DROP_RATE = 60;        // how fast grip falls to a lower target (per second)
+const HANDBRAKE_DRAG = 0.4;       // extra speed share lost per second under handbrake
+const REVERSE_SPEED_SHARE = 0.4;  // reverse top speed as a share of maxSpeed
+const DRIFT_SPEED_START = 0.5;    // speed share where hard steering starts to cut grip
+const DRIFT_SPEED_FULL = 0.8;     // speed share where hard steering gives full driftGrip
+const STEER_FULL_AT = 0.12;       // speed share where steering reaches full strength
+
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function smoothstep(a, b, v) { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
+
+function createCarState(config, x = 0, y = 0, heading = 0) {
+  return { x, y, heading, vx: 0, vy: 0, grip: config.normalGrip };
+}
+
+// Grip the car is aiming for this frame.
+function targetGrip(config, inp, speedShare) {
+  let target = config.normalGrip;
+  if (inp.left !== inp.right) {
+    target = lerp(config.normalGrip, config.driftGrip, smoothstep(DRIFT_SPEED_START, DRIFT_SPEED_FULL, speedShare));
+  }
+  if (inp.handbrake) target = Math.min(target, config.handbrakeGrip);
+  return target;
+}
+
+// Advance the car by dt seconds. Reads config fresh on every call.
+function stepCar(car, inp, dt, config) {
+  // Steering turns the car first. The velocity stays where it was, so a turned
+  // car is now pointing away from where it is travelling: that gap is the slide.
+  const fwdBefore = car.vx * Math.cos(car.heading) + car.vy * Math.sin(car.heading);
+  const steerInput = (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
+  const steerShare = Math.abs(fwdBefore) / config.maxSpeed;
+  const steerStrength = clamp(steerShare / STEER_FULL_AT, 0, 1) * (1 - 0.35 * clamp(steerShare, 0, 1));
+  car.heading += steerInput * config.steerSpeed * steerStrength * (fwdBefore < 0 ? -1 : 1) * dt;
+
+  // Split velocity into forward and sideways parts, relative to the new heading.
+  const cos = Math.cos(car.heading), sin = Math.sin(car.heading);
+  let fwd = car.vx * cos + car.vy * sin;
+  let lat = -car.vx * sin + car.vy * cos;
+
+  // Gas, brake, reverse.
+  if (inp.gas && !inp.brake) {
+    fwd += config.acceleration * dt;
+    if (fwd > config.maxSpeed) fwd = Math.max(config.maxSpeed, fwd - config.brakePower * dt);
+  } else if (inp.brake && !inp.gas) {
+    if (fwd > 0) fwd = Math.max(0, fwd - config.brakePower * dt);
+    else fwd = Math.max(-config.maxSpeed * REVERSE_SPEED_SHARE, fwd - config.acceleration * dt);
+  }
+  // Rolling drag, plus a little extra bleed under handbrake.
+  fwd -= fwd * Math.min(1, (config.friction + (inp.handbrake ? HANDBRAKE_DRAG : 0)) * dt);
+
+  // Grip eases toward its target: drops fast, recovers at gripRecoverySpeed.
+  const speedShare = Math.abs(fwd) / config.maxSpeed;
+  const target = targetGrip(config, inp, speedShare);
+  if (target < car.grip) car.grip = Math.max(target, car.grip - GRIP_DROP_RATE * dt);
+  else car.grip = Math.min(target, car.grip + config.gripRecoverySpeed * dt);
+
+  // Grip kills sideways velocity.
+  lat *= Math.exp(-car.grip * dt);
+
+  // Back to world velocity using the (possibly turned) heading.
+  const c2 = Math.cos(car.heading), s2 = Math.sin(car.heading);
+  car.vx = fwd * c2 - lat * s2;
+  car.vy = fwd * s2 + lat * c2;
+  car.x += car.vx * dt;
+  car.y += car.vy * dt;
+}
+// @sim-end
+
+/* ==================================================================
+   GAME LOGIC - the single simulation step the whole game runs through.
+   ================================================================== */
+// @sim-begin
+function createGameState(config) {
+  return { time: 0, car: createCarState(config, 0, 0, -Math.PI / 2) };
+}
+
+// Advance the whole game by dt seconds.
+function step(state, inp, dt, config) {
+  stepCar(state.car, inp, dt, config);
+  state.time += dt;
+}
+// @sim-end
+
+const PX_TO_KMH = 0.18;  // display only: converts pixels per second to km/h-style units
+const MAX_SUBSTEP = 1 / 120;
+const game = createGameState(CONFIG);
+
+/* ==================================================================
+   RENDERING - canvas drawing, camera, HUD.
+   ================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const hudSpeed = document.getElementById('hudSpeed');
+const camera = { x: 0, y: 0 };
+const CAMERA_LOOKAHEAD = 0.3;   // seconds of velocity the camera leads by
+const CAMERA_STIFFNESS = 5;     // how tightly the camera follows (higher = snappier)
+const TILE = 200;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(window.innerWidth * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function updateCamera(dt) {
+  const car = game.car;
+  const tx = car.x + car.vx * CAMERA_LOOKAHEAD;
+  const ty = car.y + car.vy * CAMERA_LOOKAHEAD;
+  const k = 1 - Math.exp(-CAMERA_STIFFNESS * dt);
+  camera.x += (tx - camera.x) * k;
+  camera.y += (ty - camera.y) * k;
+}
+
+function drawGround(w, h) {
+  ctx.fillStyle = '#2f6b2f';
+  ctx.fillRect(0, 0, w, h);
+  // Checker tiles so movement is visible on open ground.
+  ctx.fillStyle = '#357535';
+  const x0 = Math.floor((camera.x - w / 2) / TILE), x1 = Math.ceil((camera.x + w / 2) / TILE);
+  const y0 = Math.floor((camera.y - h / 2) / TILE), y1 = Math.ceil((camera.y + h / 2) / TILE);
+  for (let tx = x0; tx < x1; tx++) {
+    for (let ty = y0; ty < y1; ty++) {
+      if ((tx + ty) & 1) ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+    }
+  }
+}
+
+function drawCar() {
+  const car = game.car;
+  ctx.save();
+  ctx.translate(car.x, car.y);
+  ctx.rotate(car.heading);
+  ctx.fillStyle = '#d62828';           // body
+  ctx.fillRect(-22, -11, 44, 22);
+  ctx.fillStyle = '#8ecae6';           // windscreen
+  ctx.fillRect(2, -8, 9, 16);
+  ctx.fillStyle = '#f7f7f7';           // headlights
+  ctx.fillRect(20, -9, 3, 5);
+  ctx.fillRect(20, 4, 3, 5);
+  ctx.fillStyle = '#111';              // wheels
+  ctx.fillRect(10, -14, 9, 4); ctx.fillRect(10, 10, 9, 4);
+  ctx.fillRect(-19, -14, 9, 4); ctx.fillRect(-19, 10, 9, 4);
+  ctx.restore();
+}
+
+function render() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.width / dpr, h = canvas.height / dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.save();
+  ctx.translate(w / 2 - camera.x, h / 2 - camera.y);
+  drawGround(w, h);
+  drawCar();
+  ctx.restore();
+  const speed = Math.hypot(game.car.vx, game.car.vy);
+  hudSpeed.textContent = Math.round(speed * PX_TO_KMH);
+}
+
+/* ==================================================================
+   GAME LOOP - requestAnimationFrame with delta time.
+   ================================================================== */
+let lastTime = performance.now();
+function frame(now) {
+  let dt = Math.min((now - lastTime) / 1000, 0.1);
+  lastTime = now;
+  const steps = Math.max(1, Math.ceil(dt / MAX_SUBSTEP));
+  for (let i = 0; i < steps; i++) step(game, input, dt / steps, CONFIG);
+  updateCamera(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+camera.x = game.car.x; camera.y = game.car.y;
+requestAnimationFrame(frame);
+
+/* ==================================================================
+   TUNING PANEL - added in a later ticket.
+   ================================================================== */
+</script>
+</body>
+</html>
