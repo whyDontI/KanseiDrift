@@ -123,7 +123,6 @@ const tests = {
   }
 };
 
-
 // ---- Circuit, Walls and grass -------------------------------------------
 // Put the car on the centreline at sample `i`, offset sideways by `offset`, with given local velocity.
 function placeOnCircuit(state, i, offset, headingRelative, fwd, lat = 0) {
@@ -200,8 +199,8 @@ Object.assign(tests, {
   },
   'a fast glancing hit is a Scrape because the impact along the wall normal is small'() {
     const { config, state } = fresh({}, true);
-    // Aimed a few degrees at the wall: about 500 along it, about 60 into it.
-    placeOnCircuit(state, 20, wallLimit() - 30, Math.atan2(60, 500), Math.hypot(500, 60));
+    // Aimed a few degrees at the wall: about 500 along it, about 100 into it.
+    placeOnCircuit(state, 20, wallLimit() - 30, Math.atan2(100, 500), Math.hypot(500, 100));
     run(state, config, idle, 0.5);
     assert.strictEqual(state.crashCount, 0);
     assert.strictEqual(state.lastImpact.type, 'scrape');
@@ -225,6 +224,18 @@ Object.assign(tests, {
     }
     assert(worst <= wallLimit(), `car reached ${worst.toFixed(1)} from the centreline, wall is at ${wallLimit()}`);
     assert(state.lastImpact, 'should have hit the wall');
+  },
+  'a gentle graze is not recorded, and a Crash right after a Scrape still counts'() {
+    const { config, state } = fresh({}, true);
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.atan2(20, 300), Math.hypot(300, 20));
+    run(state, config, idle, 0.4);
+    assert.strictEqual(state.lastImpact, null, 'a 20 px/s touch should not register');
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.PI / 2, 120);
+    run(state, config, idle, 0.4);
+    assert.strictEqual(state.lastImpact.type, 'scrape');
+    placeOnCircuit(state, 20, wallLimit() - 25, Math.PI / 2, config.crashSpeed + 150);
+    run(state, config, idle, 0.15);
+    assert.strictEqual(state.crashCount, 1, 'a hard hit straight after a Scrape must be a Crash');
   },
   'a Crash is only counted once per impact, not every frame'() {
     const { config, state } = fresh({}, true);

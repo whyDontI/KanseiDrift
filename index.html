@@ -17,7 +17,10 @@ const CONFIG = {
   brakePower: 950,        // how hard brake slows you down (px/s per second)
   friction: 0.7,          // rolling drag: share of speed lost per second with no gas
   crashSpeed: 260,        // speed into a wall (px/s) above which a hit is a Crash, not a Scrape
-  grassDrag: 1.6,         // extra drag per second while any part of the car is on grass
+  grassDrag: 1.6,         // extra drag per second while the car is mostly on grass
+  wallBounce: 0.2,        // share of the speed into a wall that bounces back
+  wallScrapeDrag: 2.5,    // speed lost per second while rubbing along a wall
+  crashSpeedKept: 0.55,   // share of speed the car keeps after a Crash
   // --- Steering ---
   steerSpeed: 2.6,        // turn rate in radians per second at full lock
   // --- Grip ---
@@ -141,12 +144,7 @@ function stepCar(car, inp, dt, config) {
   car.x += car.vx * dt;
   car.y += car.vy * dt;
 }
-// @sim-end
 
-/* ==================================================================
-   GAME LOGIC - the single simulation step the whole game runs through.
-   ================================================================== */
-// @sim-begin
 /* The Circuit: a closed centreline (smoothed through the control points), a constant road
    width, and a grass verge on each side. The Wall stands at the outer edge of the verge. */
 const TRACK_CONTROLS = [
@@ -159,10 +157,7 @@ const VERGE_WIDTH = 60;        // grass between the road edge and the Wall
 const TRACK_SAMPLES = 16;      // centreline points generated per control segment
 const START_SETBACK = 80;      // how far behind the start line the car spawns
 const CAR_RADIUS = 18;         // the car's collision circle
-const WALL_RESTITUTION = 0.2;  // share of wall-normal speed that bounces back
-const WALL_SCRAPE_DRAG = 2.5;  // sideways-along-wall speed lost per second while touching
-const CRASH_SPEED_KEEP = 0.55; // share of speed kept after a Crash
-const WALL_RELEASE = 3;        // pixels clear of the wall before a hit counts as over
+const IMPACT_MIN_SPEED = 40;   // wall speed (px/s) below which a touch is not worth counting
 
 function createCircuit(controls, roadWidth, vergeWidth, samples) {
   const pts = [], n = controls.length;
@@ -170,8 +165,8 @@ function createCircuit(controls, roadWidth, vergeWidth, samples) {
     const p0 = controls[(i + n - 1) % n], p1 = controls[i], p2 = controls[(i + 1) % n], p3 = controls[(i + 2) % n];
     for (let k = 0; k < samples; k++) {
       const t = k / samples, t2 = t * t, t3 = t2 * t;
-      const cr = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
-      pts.push({ x: cr(p0.x, p1.x, p2.x, p3.x), y: cr(p0.y, p1.y, p2.y, p3.y) });
+      const spline = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+      pts.push({ x: spline(p0.x, p1.x, p2.x, p3.x), y: spline(p0.y, p1.y, p2.y, p3.y) });
     }
   }
   const a = pts[pts.length - 1], b = pts[1], len = Math.hypot(b.x - a.x, b.y - a.y);
@@ -185,67 +180,70 @@ const CIRCUIT = createCircuit(TRACK_CONTROLS, ROAD_WIDTH, VERGE_WIDTH, TRACK_SAM
 // Nearest point on the centreline to (x, y), and the unit vector from it to the car.
 function circuitQuery(circuit, x, y) {
   const pts = circuit.pts, n = pts.length;
-  let best = Infinity, cx = 0, cy = 0, bi = 0;
+  let best = Infinity, cx = 0, cy = 0, bestIndex = 0;
   for (let i = 0; i < n; i++) {
     const a = pts[i], b = pts[(i + 1) % n];
     const abx = b.x - a.x, aby = b.y - a.y;
     const t = clamp(((x - a.x) * abx + (y - a.y) * aby) / (abx * abx + aby * aby), 0, 1);
     const px = a.x + abx * t, py = a.y + aby * t;
     const d2 = (x - px) * (x - px) + (y - py) * (y - py);
-    if (d2 < best) { best = d2; cx = px; cy = py; bi = i; }
+    if (d2 < best) { best = d2; cx = px; cy = py; bestIndex = i; }
   }
   const dist = Math.sqrt(best);
   let nx = 0, ny = 1;
   if (dist > 1e-6) { nx = (x - cx) / dist; ny = (y - cy) / dist; }
-  return { dist, nx, ny, cx, cy, index: bi };
+  return { dist, nx, ny, cx, cy, index: bestIndex };
 }
 
+function scaleVelocity(car, factor) { car.vx *= factor; car.vy *= factor; }
+
+// Grass slows the car whenever it is mostly off the tarmac.
+function applyGrass(car, circuit, dt, config) {
+  const nearest = circuitQuery(circuit, car.x, car.y);
+  car.surface = nearest.dist + CAR_RADIUS * 0.5 > circuit.halfRoad ? 'grass' : 'road';
+  if (car.surface === 'grass') scaleVelocity(car, Math.exp(-config.grassDrag * dt));
+}
+
+// The Wall stops the car. A hit with speed into the Wall above crashSpeed is a Crash,
+// anything gentler (or glancing) is a Scrape. Both slow the car; touches under
+// IMPACT_MIN_SPEED just rub without being recorded.
+function collideWithWall(state, dt, config) {
+  const car = state.car, circuit = state.circuit;
+  const nearest = circuitQuery(circuit, car.x, car.y);
+  const limit = circuit.halfWall - CAR_RADIUS;
+  if (nearest.dist <= limit) return;
+  car.x = nearest.cx + nearest.nx * limit;      // push back inside
+  car.y = nearest.cy + nearest.ny * limit;
+  const intoWall = car.vx * nearest.nx + car.vy * nearest.ny;
+  if (intoWall > 0) {
+    car.vx -= (1 + config.wallBounce) * intoWall * nearest.nx;
+    car.vy -= (1 + config.wallBounce) * intoWall * nearest.ny;
+  }
+  scaleVelocity(car, Math.exp(-config.wallScrapeDrag * dt));
+  if (intoWall < IMPACT_MIN_SPEED) return;
+  const crash = intoWall > config.crashSpeed;
+  if (crash) { scaleVelocity(car, config.crashSpeedKept); state.crashCount++; }
+  else state.scrapeCount++;
+  state.lastImpact = { type: crash ? 'crash' : 'scrape', speed: intoWall, time: state.time };
+}
+// @sim-end
+
+/* ==================================================================
+   GAME LOGIC - the single simulation step the whole game runs through.
+   ================================================================== */
+// @sim-begin
 function createGameState(config) {
   const c = CIRCUIT.start;
   const car = createCarState(config, c.x - c.tx * START_SETBACK, c.y - c.ty * START_SETBACK, Math.atan2(c.ty, c.tx));
   car.surface = 'road';       // 'road' or 'grass'
-  car.wallContact = false;    // true while touching a Wall
   return { time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0 };
-}
-
-// Grass slows the car; the Wall stops it. A hit is a Crash if its speed into the Wall
-// is above crashSpeed, otherwise a Scrape. Both slow the car.
-function applySurfaceAndWalls(state, dt, config) {
-  const car = state.car, c = state.circuit;
-  let q = circuitQuery(c, car.x, car.y);
-  car.surface = q.dist + CAR_RADIUS * 0.5 > c.halfRoad ? 'grass' : 'road';
-  if (car.surface === 'grass') {
-    const k = Math.exp(-config.grassDrag * dt);
-    car.vx *= k; car.vy *= k;
-  }
-  const limit = c.halfWall - CAR_RADIUS;
-  if (q.dist <= limit) {
-    if (q.dist < limit - WALL_RELEASE) car.wallContact = false;
-    return;
-  }
-  // Push the car back inside, then take the speed out of the Wall.
-  car.x = q.cx + q.nx * limit; car.y = q.cy + q.ny * limit;
-  const vn = car.vx * q.nx + car.vy * q.ny;
-  const firstTouch = !car.wallContact;
-  car.wallContact = true;
-  if (vn > 0) {
-    car.vx -= (1 + WALL_RESTITUTION) * vn * q.nx;
-    car.vy -= (1 + WALL_RESTITUTION) * vn * q.ny;
-  }
-  const drag = Math.exp(-WALL_SCRAPE_DRAG * dt);
-  car.vx *= drag; car.vy *= drag;
-  if (firstTouch && vn > 0) {
-    const crash = vn > config.crashSpeed;
-    if (crash) { car.vx *= CRASH_SPEED_KEEP; car.vy *= CRASH_SPEED_KEEP; state.crashCount++; }
-    else state.scrapeCount++;
-    state.lastImpact = { type: crash ? 'crash' : 'scrape', speed: vn, time: state.time };
-  }
 }
 
 // Advance the whole game by dt seconds.
 function step(state, inp, dt, config) {
   stepCar(state.car, inp, dt, config);
-  applySurfaceAndWalls(state, dt, config);
+  applyGrass(state.car, state.circuit, dt, config);
+  collideWithWall(state, dt, config);
   state.time += dt;
 }
 // @sim-end
