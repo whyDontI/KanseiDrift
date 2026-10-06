@@ -59,16 +59,16 @@ const tests = {
     assert(fwd <= config.maxSpeed + 1, 'must not exceed maxSpeed');
   },
   'top speed is the lower of maxSpeed and what drag allows (about acceleration / friction)'() {
-    const top = overrides => {
+    const topSpeed = overrides => {
       const { config, state } = fresh(overrides);
       let best = 0;
       for (let t = 0; t < 25; t += DT) { sim.step(state, { ...idle, gas: true }, DT, config); best = Math.max(best, Math.hypot(state.car.vx, state.car.vy)); }
       return best;
     };
-    assert(Math.abs(top({ maxSpeed: 300 }) - 300) < 10, 'a low maxSpeed is the limit');
+    assert(Math.abs(topSpeed({ maxSpeed: 300 }) - 300) < 10, 'a low maxSpeed is the limit');
     const dragLimit = sim.CONFIG.acceleration / sim.CONFIG.friction;
-    assert(Math.abs(top({ maxSpeed: 1200 }) - dragLimit) < 10, 'a very high maxSpeed is limited by drag');
-    assert(top({ maxSpeed: 1200, acceleration: 1000 }) > dragLimit * 1.4, 'more acceleration lifts that limit');
+    assert(Math.abs(topSpeed({ maxSpeed: 1200 }) - dragLimit) < 10, 'a very high maxSpeed is limited by drag');
+    assert(topSpeed({ maxSpeed: 1200, acceleration: 1000 }) > dragLimit * 1.4, 'more acceleration lifts that limit');
   },
   'car cannot turn while stationary'() {
     const { config, state } = fresh();
