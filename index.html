@@ -81,6 +81,9 @@ const PRESETS = {
   #hud .small { font-size: 14px; opacity: .8; }
   #hudScore { position: fixed; left: 16px; top: 16px; color: #fff; text-shadow: 0 1px 3px #000; pointer-events: none; }
   #hudScore .big { font-size: 34px; font-weight: 700; line-height: 1.1; }
+  #hudLap { position: fixed; left: 50%; top: 16px; transform: translateX(-50%); color: #fff; text-shadow: 0 1px 3px #000; pointer-events: none; text-align: center; }
+  #hudLap .big { font-size: 30px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  #hudLap .small { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; }
   #hudScore .small { font-size: 13px; opacity: .8; }
   #hudScore .chain { font-size: 20px; font-weight: 700; color: #ffd166; min-height: 26px; }
   #gear { position: fixed; top: 12px; right: 12px; width: 36px; height: 36px; border-radius: 50%; border: 0;
@@ -110,6 +113,8 @@ const PRESETS = {
 <canvas id="game"></canvas>
 <div id="hudScore"><div class="small">SCORE</div><div class="big" id="hudTotal">0</div>
   <div class="chain" id="hudChain"></div><div class="small" id="hudBest">Best chain 0</div></div>
+<div id="hudLap"><div class="small" id="hudLapNo">LAP 1</div><div class="big" id="hudLapTime">--:--.---</div>
+  <div class="small" id="hudLapLast">Last --:--.---</div><div class="small" id="hudLapBest">Best --:--.---</div><div class="small" id="hudLapCp"></div></div>
 <div id="hud"><div><span class="big" id="hudSpeed">0</span> <span class="small">km/h</span></div><div class="small" id="hudDrift"></div></div>
 
 <script>
@@ -221,11 +226,18 @@ const TRACK_CONTROLS = [
 const ROAD_WIDTH = 220;        // width of the tarmac in pixels
 const VERGE_WIDTH = 60;        // grass between the road edge and the Wall
 const TRACK_SAMPLES = 16;      // centreline points generated per control segment
+const CHECKPOINT_COUNT = 6;    // Checkpoints spread evenly around the loop (the start line is separate)
 const START_SETBACK = 80;      // how far behind the start line the car spawns
 const CAR_RADIUS = 18;         // the car's collision circle
 const IMPACT_MIN_SPEED = 40;   // wall speed (px/s) below which a touch is not worth counting
 
-function createCircuit(controls, roadWidth, vergeWidth, samples) {
+// A gate is a line across the road at centreline sample i: its position and travel direction.
+function gateAt(pts, i) {
+  const n = pts.length, a = pts[(i + n - 1) % n], b = pts[(i + 1) % n], len = Math.hypot(b.x - a.x, b.y - a.y);
+  return { x: pts[i].x, y: pts[i].y, tx: (b.x - a.x) / len, ty: (b.y - a.y) / len };
+}
+
+function createCircuit(controls, roadWidth, vergeWidth, samples, checkpointCount = CHECKPOINT_COUNT) {
   const pts = [], n = controls.length;
   for (let i = 0; i < n; i++) {
     const p0 = controls[(i + n - 1) % n], p1 = controls[i], p2 = controls[(i + 1) % n], p3 = controls[(i + 2) % n];
@@ -235,10 +247,12 @@ function createCircuit(controls, roadWidth, vergeWidth, samples) {
       pts.push({ x: spline(p0.x, p1.x, p2.x, p3.x), y: spline(p0.y, p1.y, p2.y, p3.y) });
     }
   }
-  const a = pts[pts.length - 1], b = pts[1], len = Math.hypot(b.x - a.x, b.y - a.y);
+  // Checkpoints sit evenly around the loop; the start/finish line is sample 0.
+  const checkpoints = [];
+  for (let k = 1; k <= checkpointCount; k++) checkpoints.push(gateAt(pts, Math.round(k * pts.length / (checkpointCount + 1))));
   return {
     pts, halfRoad: roadWidth / 2, halfWall: roadWidth / 2 + vergeWidth,
-    start: { x: pts[0].x, y: pts[0].y, tx: (b.x - a.x) / len, ty: (b.y - a.y) / len }
+    start: gateAt(pts, 0), checkpoints
   };
 }
 const CIRCUIT = createCircuit(TRACK_CONTROLS, ROAD_WIDTH, VERGE_WIDTH, TRACK_SAMPLES);
@@ -407,12 +421,60 @@ function updateScoring(state, dt, config) {
   }
 }
 
+/* ---- Laps: start/finish line, ordered Checkpoints, lap timer ---- */
+
+// Did moving from (x0, y0) to (x1, y1) cross the gate? +1 forward, -1 backward, 0 not at all.
+function gateCrossing(gate, halfWidth, x0, y0, x1, y1) {
+  const s0 = (x0 - gate.x) * gate.tx + (y0 - gate.y) * gate.ty;
+  const s1 = (x1 - gate.x) * gate.tx + (y1 - gate.y) * gate.ty;
+  if ((s0 < 0) === (s1 < 0)) return 0;
+  const t = s0 / (s0 - s1);
+  const sideways = (x0 + (x1 - x0) * t - gate.x) * -gate.ty + (y0 + (y1 - y0) * t - gate.y) * gate.tx;
+  if (Math.abs(sideways) > halfWidth) return 0;
+  return s1 >= 0 ? 1 : -1;
+}
+
+function createLap() {
+  return { started: false, startTime: 0, nextCheckpoint: 0, count: 0, lastLapTime: null, bestLapTime: null, lastX: 0, lastY: 0 };
+}
+
+function currentLapTime(state) { return state.lap.started ? state.time - state.lap.startTime : 0; }
+
+// Called after every step, with the car having moved from where the last step left it. Only
+// forward crossings count: the first of the line starts the timer, Checkpoints must come in
+// order, and the line then finishes a Lap. Deliberately placing the car (a respawn) must also
+// set lap.lastX and lap.lastY, so that the jump is not mistaken for driving across a gate.
+function updateLap(state) {
+  const lap = state.lap, car = state.car, c = state.circuit, px = lap.lastX, py = lap.lastY;
+  lap.lastX = car.x; lap.lastY = car.y;
+  if (gateCrossing(c.start, c.halfWall, px, py, car.x, car.y) === 1) {
+    if (!lap.started) {
+      lap.started = true;
+      lap.startTime = state.time;
+      lap.nextCheckpoint = 0;
+    } else if (lap.nextCheckpoint === c.checkpoints.length) {
+      const lapTime = state.time - lap.startTime;
+      lap.count++;
+      lap.lastLapTime = lapTime;
+      lap.bestLapTime = lap.bestLapTime === null ? lapTime : Math.min(lap.bestLapTime, lapTime);
+      lap.startTime = state.time;
+      lap.nextCheckpoint = 0;
+    }
+  }
+  if (lap.started && lap.nextCheckpoint < c.checkpoints.length &&
+      gateCrossing(c.checkpoints[lap.nextCheckpoint], c.halfWall, px, py, car.x, car.y) === 1) {
+    lap.nextCheckpoint++;
+  }
+}
+
 function createGameState(config) {
   const c = CIRCUIT.start;
   const car = createCarState(config, c.x - c.tx * START_SETBACK, c.y - c.ty * START_SETBACK, Math.atan2(c.ty, c.tx));
   car.surface = 'road';       // 'road' or 'grass'
+  const lap = createLap();
+  lap.lastX = car.x; lap.lastY = car.y;
   return {
-    time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0, scoring: createScoring(),
+    time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0, scoring: createScoring(), lap,
     effects: { smoke: [], skids: [], wheels: [null, null], smokeCarry: 0, seed: 1 }
   };
 }
@@ -425,6 +487,7 @@ function step(state, inp, dt, config) {
   updateDrift(state.car, config);
   updateScoring(state, dt, config);
   state.time += dt;
+  updateLap(state);
   updateEffects(state, dt);
 }
 // @sim-end
@@ -443,6 +506,11 @@ const hudDrift = document.getElementById('hudDrift');
 const hudTotal = document.getElementById('hudTotal');
 const hudChain = document.getElementById('hudChain');
 const hudBest = document.getElementById('hudBest');
+const hudLapNo = document.getElementById('hudLapNo');
+const hudLapTime = document.getElementById('hudLapTime');
+const hudLapLast = document.getElementById('hudLapLast');
+const hudLapBest = document.getElementById('hudLapBest');
+const hudLapCp = document.getElementById('hudLapCp');
 const camera = { x: 0, y: 0 };
 const CAMERA_LOOKAHEAD = 0.3;   // seconds of velocity the camera leads by
 const CAMERA_STIFFNESS = 5;     // how tightly the camera follows (higher = snappier)
@@ -502,6 +570,17 @@ function drawCircuit() {
   ctx.strokeStyle = '#4a4d52';                        // road
   ctx.lineWidth = c.halfRoad * 2;
   ctx.stroke();
+  game.circuit.checkpoints.forEach((g, i) => {        // Checkpoint gates, the next one due in yellow
+    const due = game.lap.started && i === game.lap.nextCheckpoint;
+    ctx.strokeStyle = due ? 'rgba(255,209,102,0.75)' : 'rgba(255,255,255,0.16)';
+    ctx.lineWidth = due ? 6 : 4;
+    ctx.lineCap = 'butt';
+    ctx.beginPath();
+    ctx.moveTo(g.x + g.ty * c.halfRoad, g.y - g.tx * c.halfRoad);
+    ctx.lineTo(g.x - g.ty * c.halfRoad, g.y + g.tx * c.halfRoad);
+    ctx.stroke();
+  });
+  ctx.lineCap = 'round';
   ctx.strokeStyle = 'rgba(255,255,255,0.35)';         // centre dashes
   ctx.lineWidth = 4;
   ctx.setLineDash([40, 40]);
@@ -570,6 +649,13 @@ function drawCar() {
   ctx.restore();
 }
 
+// m:ss.mmm, or dashes when there is no time yet.
+function formatTime(seconds) {
+  if (seconds === null || seconds === undefined) return '--:--.---';
+  const m = Math.floor(seconds / 60), rest = seconds - m * 60;
+  return m + ':' + (rest < 10 ? '0' : '') + rest.toFixed(3);
+}
+
 const formatPoints = points => Math.floor(points).toLocaleString();   // whole points, with thousands separators
 
 function render() {
@@ -590,6 +676,12 @@ function render() {
   hudTotal.textContent = formatPoints(sc.total);
   hudChain.textContent = sc.pending > 0 ? '+' + formatPoints(sc.pending) + '  \u00d7' + sc.multiplier : '';
   hudBest.textContent = 'Best chain ' + formatPoints(sc.bestChain);
+  const lap = game.lap;
+  hudLapNo.textContent = lap.started ? 'LAP ' + (lap.count + 1) : 'CROSS THE LINE TO START';
+  hudLapTime.textContent = lap.started ? formatTime(currentLapTime(game)) : '--:--.---';
+  hudLapLast.textContent = 'Last ' + formatTime(lap.lastLapTime);
+  hudLapBest.textContent = 'Best ' + formatTime(lap.bestLapTime);
+  hudLapCp.textContent = lap.started ? 'Checkpoint ' + lap.nextCheckpoint + '/' + game.circuit.checkpoints.length : '';
   hudDrift.textContent = game.car.drifting ? 'DRIFT ' + Math.round(game.car.slipAngle) + '\u00b0' : '';
 }
 
