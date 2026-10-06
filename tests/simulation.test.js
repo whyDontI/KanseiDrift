@@ -384,6 +384,123 @@ Object.assign(tests, {
   }
 });
 
+// ---- Drift scoring ---------------------------------------------------------
+// Hold a Drift for `seconds` (slip set every step), then return the scoring state.
+function driftFor(state, config, seconds, dt = DT) {
+  for (let t = 0; t < seconds - 1e-9; t += dt) setSlip(state, config, 400, 30, dt);
+}
+function coastFor(state, config, seconds) {   // stop drifting and wait
+  state.car.vx = state.car.vy = 0;
+  run(state, config, idle, seconds);
+}
+
+Object.assign(tests, {
+  'pending points rise during a Drift, at driftScoreRate with a multiplier of 1 at first'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 1);
+    const sc = state.scoring;
+    assert(Math.abs(sc.pending - config.driftScoreRate) < 1.5, 'pending was ' + sc.pending);
+    assert.strictEqual(sc.multiplier, 1);
+    assert.strictEqual(sc.total, 0, 'nothing is banked while the chain runs');
+  },
+  'the Combo Multiplier grows with the length of the Drift Chain'() {
+    const { config, state } = fresh();
+    driftFor(state, config, config.comboStepTime * 0.5);
+    assert.strictEqual(state.scoring.multiplier, 1);
+    driftFor(state, config, config.comboStepTime * 0.6);
+    assert.strictEqual(state.scoring.multiplier, 2);
+    driftFor(state, config, config.comboStepTime * 1);
+    assert.strictEqual(state.scoring.multiplier, 3);
+  },
+  'a longer chain earns more per second than a short one'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 1);
+    const first = state.scoring.pending;
+    driftFor(state, config, config.comboStepTime * 2);   // now into a higher multiplier
+    const later = state.scoring.pending;
+    driftFor(state, config, 1);
+    assert((state.scoring.pending - later) > first * 1.5, 'a second at a higher multiplier should score more');
+  },
+  'not drifting for comboTimeout banks the pending points and resets the multiplier'() {
+    const { config, state } = fresh();
+    driftFor(state, config, config.comboStepTime * 1.5);
+    const earned = state.scoring.pending;
+    assert(earned > 0 && state.scoring.multiplier === 2);
+    coastFor(state, config, config.comboTimeout * 0.5);
+    assert.strictEqual(state.scoring.total, 0, 'not banked before the timeout');
+    assert(state.scoring.pending > 0);
+    coastFor(state, config, config.comboTimeout);
+    assert(Math.abs(state.scoring.total - earned) < 1e-6, 'pending should be banked in full');
+    assert.strictEqual(state.scoring.pending, 0);
+    assert.strictEqual(state.scoring.multiplier, 1);
+  },
+  'drifting again before the timeout continues the same chain'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 1);
+    const before = state.scoring.pending;
+    coastFor(state, config, config.comboTimeout * 0.5);
+    driftFor(state, config, 0.5);
+    assert(state.scoring.pending > before, 'the same chain should keep growing');
+    assert.strictEqual(state.scoring.total, 0);
+  },
+  'best chain is the biggest single banked chain'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 2); coastFor(state, config, config.comboTimeout + 0.2);
+    const first = state.scoring.total;
+    driftFor(state, config, 0.5); coastFor(state, config, config.comboTimeout + 0.2);
+    driftFor(state, config, 4); coastFor(state, config, config.comboTimeout + 0.2);
+    const sc = state.scoring;
+    assert(sc.bestChain > first, 'the longest chain should be the best');
+    assert(sc.total > sc.bestChain, 'total adds up all the chains');
+  },
+  'a Crash loses the pending points'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 1);
+    assert(state.scoring.pending > 5);
+    state.circuit = sim.CIRCUIT;   // now meet a real Wall
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.PI / 2, config.crashSpeed + 150);
+    run(state, config, idle, 0.4);
+    assert.strictEqual(state.crashCount, 1);
+    assert.strictEqual(state.scoring.pending, 0);
+    assert.strictEqual(state.scoring.total, 0, 'a lost chain is not banked');
+    assert.strictEqual(state.scoring.multiplier, 1);
+  },
+  'a Crash deep into a long chain loses it all, and the multiplier starts again at 1'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 3);
+    assert(state.scoring.multiplier >= 2, 'the chain should have built a multiplier');
+    state.circuit = sim.CIRCUIT;
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.PI / 2, config.crashSpeed + 150);
+    run(state, config, idle, 0.3);
+    assert.strictEqual(state.crashCount, 1);
+    assert.strictEqual(state.scoring.total, 0, 'the lost chain is not banked');
+    assert.strictEqual(state.scoring.pending, 0);
+    assert.strictEqual(state.scoring.multiplier, 1);
+    assert.strictEqual(state.scoring.bestChain, 0, 'a lost chain is not a best chain');
+  },
+  'a Scrape keeps the chain alive'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 1);
+    const pending = state.scoring.pending;
+    state.circuit = sim.CIRCUIT;   // now meet a real Wall
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.PI / 2, 120);
+    run(state, config, idle, 0.4);
+    assert.strictEqual(state.lastImpact.type, 'scrape');
+    assert.strictEqual(state.crashCount, 0);
+    assert(state.scoring.pending >= pending, 'a Scrape must not cost points');
+  },
+  'driftScoreRate and comboTimeout take effect live'() {
+    const earn = rate => { const { config, state } = fresh({ driftScoreRate: rate }); driftFor(state, config, 1); return state.scoring.pending; };
+    assert(Math.abs(earn(40) / earn(20) - 2) < 0.1);
+    const { config, state } = fresh({ comboTimeout: 0.3 });
+    driftFor(state, config, 1); coastFor(state, config, 0.5);
+    assert(state.scoring.total > 0, 'a shorter comboTimeout should have banked already');
+  },
+  'the new scoring value has a slider definition'() {
+    assert(sim.CONFIG_META.comboStepTime && sim.CONFIG_META.comboStepTime.group === 'Drift Score');
+  }
+});
+
 let failed = 0;
 for (const [name, fn] of Object.entries(tests)) {
   try { fn(); console.log('ok   - ' + name); }
