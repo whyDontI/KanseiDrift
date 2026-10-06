@@ -6,7 +6,7 @@ const assert = require('assert');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const code = [...html.matchAll(/\/\/ @sim-begin([\s\S]*?)\/\/ @sim-end/g)].map(m => m[1]).join('\n');
-const sim = new Function(code + '\nreturn { CONFIG, DEFAULT_CONFIG, CONFIG_META, PRESETS, createGameState, step, CIRCUIT, createCircuit, circuitQuery };')();
+const sim = new Function(code + '\nreturn { CONFIG, DEFAULT_CONFIG, CONFIG_META, PRESETS, createGameState, step, CIRCUIT, createCircuit, circuitQuery, SKID_LIFE, SKID_MAX };')();
 
 const DT = 1 / 60;
 const idle = { gas: false, brake: false, left: false, right: false, handbrake: false };
@@ -274,6 +274,113 @@ Object.assign(tests, {
   'presets rank by sideways grip: Sideways Mode slidiest, Realistic grippiest'() {
     const g = n => ({ ...sim.DEFAULT_CONFIG, ...sim.PRESETS[n] }).driftGrip;
     assert(g('Sideways Mode') < g('Arcade') && g('Arcade') < g('Realistic'));
+  }
+});
+
+// ---- Drift detection, smoke and skid marks --------------------------------
+// Give the car a speed and a slip angle (degrees between where it points and where it travels), then take one tiny step.
+function setSlip(state, config, speed, slipDeg, dt = 1 / 240) {
+  const car = state.car, a = car.heading + slipDeg * Math.PI / 180;
+  car.vx = Math.cos(a) * speed; car.vy = Math.sin(a) * speed;
+  sim.step(state, idle, dt, config);
+}
+
+Object.assign(tests, {
+  'a Drift starts above driftEnterAngle at or above minDriftSpeed'() {
+    const { config, state } = fresh();
+    setSlip(state, config, 400, config.driftEnterAngle + 8);
+    assert.strictEqual(state.car.drifting, true);
+  },
+  'no Drift below minDriftSpeed, however sideways the car is'() {
+    const { config, state } = fresh();
+    setSlip(state, config, config.minDriftSpeed * 0.5, 40);
+    assert.strictEqual(state.car.drifting, false);
+  },
+  'no Drift at a small slip angle'() {
+    const { config, state } = fresh();
+    setSlip(state, config, 400, config.driftExitAngle * 0.4);
+    assert.strictEqual(state.car.drifting, false);
+  },
+  'a Drift ends below driftExitAngle'() {
+    const { config, state } = fresh();
+    setSlip(state, config, 400, config.driftEnterAngle + 10);
+    assert.strictEqual(state.car.drifting, true);
+    setSlip(state, config, 400, config.driftExitAngle * 0.4);
+    assert.strictEqual(state.car.drifting, false);
+  },
+  'between the two angles the Drift flag holds its state (hysteresis, no flicker)'() {
+    const mid = c => (c.driftEnterAngle + c.driftExitAngle) / 2;
+    for (const startDrifting of [true, false]) {
+      const { config, state } = fresh();
+      setSlip(state, config, 400, startDrifting ? config.driftEnterAngle + 10 : 0);
+      assert.strictEqual(state.car.drifting, startDrifting);
+      let flips = 0, last = state.car.drifting;
+      for (let i = 0; i < 100; i++) {
+        setSlip(state, config, 400, mid(config) + (i % 2 ? 1 : -1));
+        if (state.car.drifting !== last) { flips++; last = state.car.drifting; }
+      }
+      assert.strictEqual(flips, 0, `flag flickered (started ${startDrifting})`);
+      assert.strictEqual(state.car.drifting, startDrifting);
+    }
+  },
+  'a Drift also ends when the car has nearly stopped'() {
+    const { config, state } = fresh();
+    setSlip(state, config, 400, config.driftEnterAngle + 10);
+    setSlip(state, config, config.minDriftSpeed * 0.2, config.driftEnterAngle + 10);
+    assert.strictEqual(state.car.drifting, false);
+  },
+  'an exit angle set above the enter angle cannot trap the car in a Drift'() {
+    const { config, state } = fresh({ driftEnterAngle: 12, driftExitAngle: 30 });
+    setSlip(state, config, 400, 20);
+    assert.strictEqual(state.car.drifting, true);
+    setSlip(state, config, 400, 4);
+    assert.strictEqual(state.car.drifting, false);
+  },
+  'lower driftGrip produces a Drift where normalGrip does not'() {
+    const everDrifts = driftGrip => {
+      const { config, state } = fresh({ driftGrip });
+      run(state, config, { ...idle, gas: true }, 5);
+      let drifted = false;
+      for (let t = 0; t < 2; t += DT) {
+        sim.step(state, { ...idle, gas: true, left: true }, DT, config);
+        drifted = drifted || state.car.drifting;
+      }
+      return drifted;
+    };
+    assert.strictEqual(everDrifts(sim.CONFIG.normalGrip), false, 'driftGrip equal to normalGrip should not drift');
+    assert.strictEqual(everDrifts(1.5), true, 'a slidier driftGrip should drift');
+  },
+  'driving straight never Drifts and makes no smoke or skid marks'() {
+    const { config, state } = fresh();
+    run(state, config, { ...idle, gas: true }, 5);
+    assert.strictEqual(state.car.drifting, false);
+    assert.strictEqual(state.effects.smoke.length, 0);
+    assert.strictEqual(state.effects.skids.length, 0);
+  },
+  'smoke and skid marks appear while Drifting'() {
+    const { config, state } = fresh();
+    for (let i = 0; i < 30; i++) setSlip(state, config, 400, 30, DT);
+    assert(state.car.drifting);
+    assert(state.effects.smoke.length > 5, 'expected smoke');
+    assert(state.effects.skids.length > 5, 'expected skid marks');
+  },
+  'smoke dies away once the Drift ends, but skid marks stay and then fade slowly'() {
+    const { config, state } = fresh();
+    for (let i = 0; i < 30; i++) setSlip(state, config, 400, 30, DT);
+    const marks = state.effects.skids.length;
+    state.car.vx = state.car.vy = 0;
+    run(state, config, idle, 2);
+    assert.strictEqual(state.car.drifting, false);
+    assert.strictEqual(state.effects.smoke.length, 0, 'smoke should be gone');
+    assert.strictEqual(state.effects.skids.length, marks, 'skid marks should still be there');
+    run(state, config, idle, sim.SKID_LIFE + 2);
+    assert.strictEqual(state.effects.skids.length, 0, 'skid marks should have faded away');
+  },
+  'skid marks are capped so a long Drift cannot grow without limit'() {
+    const { config, state } = fresh();
+    for (let i = 0; i < 60 * 40; i++) setSlip(state, config, 400, 30, DT);
+    assert(state.effects.skids.length <= sim.SKID_MAX);
+    assert(state.effects.skids.length > 100);
   }
 });
 

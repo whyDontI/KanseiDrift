@@ -10,6 +10,10 @@ A top-down 2D drift game where the player drives a car around a closed circuit, 
 The state of the car sliding sideways: the angle between heading and velocity is above an entry threshold at sufficient speed, and it stays on until the angle falls below a lower exit threshold.
 _Avoid_: Slide, skid (a skid is the mark left on the ground, not the state)
 
+**Slip Angle**:
+The angle between where the car points and where it is travelling; a Drift starts when it passes the entry angle and ends when it falls below the lower exit angle.
+_Avoid_: Drift angle, side angle
+
 **Tuning Panel**:
 The floating overlay of sliders that changes the car's handling values live while driving.
 _Avoid_: Settings, debug menu
