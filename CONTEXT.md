@@ -73,3 +73,41 @@ _Avoid_: Round, loop
 **Records**:
 The persisted best lap time and best score, stored separately from tuning values and untouched by the Tuning Panel's Reset.
 _Avoid_: High scores (when meaning lap time too)
+
+### Multiplayer
+
+**Room**:
+A private online session that people join with a short room code, shared as a Join Link.
+_Avoid_: Lobby (that is the waiting screen), game, server
+
+**Host**:
+The Player who created a Room; chooses the number of Laps and starts the Race.
+_Avoid_: Owner, admin
+
+**Player**:
+A person in a Room, with a typed name and an automatically assigned car colour. Players have no accounts.
+_Avoid_: User, client, racer
+
+**Join Link**:
+A web address that carries a Room's code, so opening it puts the person straight into that Room.
+_Avoid_: Invite, room URL
+
+**Lobby**:
+The waiting screen of a Room before the Race starts, listing its Players.
+_Avoid_: Waiting room
+
+**Race**:
+One contest in a Room over a set number of Laps, starting from a shared countdown. Each Player still earns their own Total Score while racing.
+_Avoid_: Match, round, session
+
+**Rival Car**:
+Another Player's car as seen on your screen. Cars never collide with each other.
+_Avoid_: Ghost (a ghost is a replay of a past lap), opponent, remote car
+
+**Standings**:
+The ranking of Players in a Race by Laps completed and then time, shown with each Player's Total Score alongside.
+_Avoid_: Leaderboard, results table
+
+**Single Player**:
+Playing alone on a device with no Room; works offline from the plain file.
+_Avoid_: Offline mode, practice
