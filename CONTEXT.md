@@ -7,7 +7,7 @@ A top-down 2D drift game where the player drives a car around a closed circuit, 
 ### Driving
 
 **Drift**:
-The state of the car sliding sideways: the angle between heading and velocity is above an entry threshold at sufficient speed, and it stays on until the angle falls below a lower exit threshold.
+The state of the car sliding sideways: the angle between heading and velocity is above an entry threshold at sufficient speed, and it stays on until the angle falls below a lower exit threshold or the car has nearly stopped.
 _Avoid_: Slide, skid (a skid is the mark left on the ground, not the state)
 
 **Slip Angle**:

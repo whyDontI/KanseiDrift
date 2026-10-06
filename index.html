@@ -319,6 +319,17 @@ const SKID_LIFE = 25;          // seconds before a skid mark has faded away
 const SKID_MAX = 2500;         // most skid mark segments kept at once
 const SKID_MIN_STEP = 2;       // pixels a wheel must move before a new mark segment is laid
 const REAR_WHEELS = [{ x: -14.5, y: -12 }, { x: -14.5, y: 12 }];   // car-local wheel centres
+const SMOKE_DAMPING = 2;       // how quickly a puff loses its speed (per second)
+const SMOKE_INHERIT = 0.1;     // share of the car's velocity a new puff starts with
+const SMOKE_SPREAD = 40;       // random sideways kick given to a new puff (px/s)
+
+/* ---- Effects: smoke and skid marks (kept DOM-free so the tests can run them) ---- */
+
+// World positions of the car's rear wheels.
+function rearWheelPositions(car) {
+  const cos = Math.cos(car.heading), sin = Math.sin(car.heading);
+  return REAR_WHEELS.map(w => ({ x: car.x + w.x * cos - w.y * sin, y: car.y + w.x * sin + w.y * cos }));
+}
 
 function nextRandom(fx) {   // tiny seeded generator, so effects are repeatable
   fx.seed = (Math.imul(fx.seed, 1664525) + 1013904223) >>> 0;
@@ -329,7 +340,7 @@ function nextRandom(fx) {   // tiny seeded generator, so effects are repeatable
 function updateEffects(state, dt) {
   const fx = state.effects, car = state.car;
   for (const p of fx.smoke) {
-    const damp = Math.exp(-2 * dt);
+    const damp = Math.exp(-SMOKE_DAMPING * dt);
     p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= damp; p.vy *= damp; p.age += dt;
   }
   fx.smoke = fx.smoke.filter(p => p.age < SMOKE_LIFE);
@@ -340,9 +351,7 @@ function updateEffects(state, dt) {
   fx.smokeCarry = car.drifting ? fx.smokeCarry + SMOKE_PER_SECOND * dt : 0;
   const puffs = Math.floor(fx.smokeCarry);
   fx.smokeCarry -= puffs;
-  const cos = Math.cos(car.heading), sin = Math.sin(car.heading);
-  REAR_WHEELS.forEach((w, i) => {
-    const x = car.x + w.x * cos - w.y * sin, y = car.y + w.x * sin + w.y * cos;
+  rearWheelPositions(car).forEach(({ x, y }, i) => {
     if (!car.drifting) { fx.wheels[i] = null; return; }
     const prev = fx.wheels[i];
     if (!prev) fx.wheels[i] = { x, y };
@@ -351,7 +360,7 @@ function updateEffects(state, dt) {
       fx.wheels[i] = { x, y };
     }
     for (let n = 0; n < puffs; n++) {
-      fx.smoke.push({ x, y, vx: car.vx * 0.1 + (nextRandom(fx) - 0.5) * 40, vy: car.vy * 0.1 + (nextRandom(fx) - 0.5) * 40, age: 0 });
+      fx.smoke.push({ x, y, vx: car.vx * SMOKE_INHERIT + (nextRandom(fx) - 0.5) * SMOKE_SPREAD, vy: car.vy * SMOKE_INHERIT + (nextRandom(fx) - 0.5) * SMOKE_SPREAD, age: 0 });
     }
   });
   if (fx.skids.length > SKID_MAX) fx.skids.splice(0, fx.skids.length - SKID_MAX);
@@ -467,20 +476,24 @@ function drawCircuit() {
   ctx.restore();
 }
 
-// Skid marks fade out over SKID_LIFE seconds.
+// Skid marks fade out over SKID_LIFE seconds. Segments are batched into a few
+// opacity levels so thousands of them cost only a handful of draw calls.
+const SKID_FADE_LEVELS = 8;
 function drawSkids() {
-  const fx = game.effects;
+  const buckets = Array.from({ length: SKID_FADE_LEVELS }, () => []);
+  for (const m of game.effects.skids) {
+    const fade = 1 - (game.time - m.t) / SKID_LIFE;
+    if (fade > 0) buckets[Math.min(SKID_FADE_LEVELS - 1, Math.floor(fade * SKID_FADE_LEVELS))].push(m);
+  }
   ctx.lineCap = 'round';
   ctx.lineWidth = 4;
-  for (const m of fx.skids) {
-    const fade = 1 - (game.time - m.t) / SKID_LIFE;
-    if (fade <= 0) continue;
-    ctx.strokeStyle = 'rgba(12,12,14,' + (0.55 * fade).toFixed(3) + ')';
+  buckets.forEach((marks, level) => {
+    if (!marks.length) return;
+    ctx.strokeStyle = 'rgba(12,12,14,' + (0.55 * (level + 0.5) / SKID_FADE_LEVELS).toFixed(3) + ')';
     ctx.beginPath();
-    ctx.moveTo(m.x1, m.y1);
-    ctx.lineTo(m.x2, m.y2);
+    for (const m of marks) { ctx.moveTo(m.x1, m.y1); ctx.lineTo(m.x2, m.y2); }
     ctx.stroke();
-  }
+  });
 }
 
 // Smoke puffs grow and thin out as they age.
