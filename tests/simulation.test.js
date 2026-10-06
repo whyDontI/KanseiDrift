@@ -6,7 +6,7 @@ const assert = require('assert');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const code = [...html.matchAll(/\/\/ @sim-begin([\s\S]*?)\/\/ @sim-end/g)].map(m => m[1]).join('\n');
-const sim = new Function(code + '\nreturn { CONFIG, DEFAULT_CONFIG, CONFIG_META, PRESETS, createGameState, step, CIRCUIT, createCircuit, circuitQuery, SKID_LIFE, SKID_MAX, currentLapTime };')();
+const sim = new Function(code + '\nreturn { CONFIG, DEFAULT_CONFIG, CONFIG_META, PRESETS, createGameState, step, CIRCUIT, createCircuit, circuitQuery, SKID_LIFE, SKID_MAX, currentLapTime, createRecords, parseRecords };')();
 
 const DT = 1 / 60;
 const idle = { gas: false, brake: false, left: false, right: false, handbrake: false };
@@ -624,6 +624,125 @@ Object.assign(tests, {
     walk(state, config, fullLap());
     assert.strictEqual(state.lap.count, 1);
     assert.strictEqual(state.scoring.total, 123);
+  }
+});
+
+// ---- Records and the R reset -------------------------------------------------
+const pressR = { ...idle, respawn: true };
+// Drive Checkpoints 0..k-1 (so k have been passed), staying on the centreline.
+function passCheckpoints(state, config, k) {
+  const idx = i => sim.CIRCUIT.pts.findIndex(p => Math.hypot(p.x - sim.CIRCUIT.checkpoints[i].x, p.y - sim.CIRCUIT.checkpoints[i].y) < 1);
+  walk(state, config, [spawnPoint(), ...along(0, 3)]);
+  for (let i = 0; i < k; i++) walk(state, config, along(i === 0 ? 3 : idx(i - 1) + 1, idx(i) + 2));
+}
+
+Object.assign(tests, {
+  'R puts the car back at the last passed Checkpoint, stationary and facing along the road'() {
+    const { config, state } = fresh({}, true);
+    passCheckpoints(state, config, 3);
+    assert.strictEqual(state.lap.nextCheckpoint, 3);
+    state.car.vx = 300; state.car.vy = -200; state.car.drifting = true;
+    state.car.x += 400;                                   // somewhere else entirely
+    sim.step(state, pressR, DT, config);
+    const cp = sim.CIRCUIT.checkpoints[2], car = state.car;
+    assert(Math.hypot(car.x - cp.x, car.y - cp.y) < 5, 'should be at the third Checkpoint');
+    assert(Math.hypot(car.vx, car.vy) < 1, 'should be stationary');
+    assert(Math.cos(car.heading) * cp.tx + Math.sin(car.heading) * cp.ty > 0.99, 'should face forward');
+    assert.strictEqual(car.drifting, false);
+  },
+  'R with no Checkpoint passed puts the car back at the start'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint(), ...along(0, 3)]);
+    assert.strictEqual(state.lap.nextCheckpoint, 0);
+    sim.step(state, pressR, DT, config);
+    const s = spawnPoint();
+    assert(Math.hypot(state.car.x - s.x, state.car.y - s.y) < 5);
+  },
+  'R ends the pending Drift Chain without banking it'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 2);
+    const pending = state.scoring.pending;
+    assert(pending > 0);
+    state.circuit = sim.CIRCUIT;
+    sim.step(state, pressR, DT, config);
+    assert.strictEqual(state.scoring.pending, 0);
+    assert.strictEqual(state.scoring.multiplier, 1);
+    assert.strictEqual(state.scoring.total, 0, 'a reset chain is not banked');
+    run(state, config, idle, config.comboTimeout + 1);
+    assert.strictEqual(state.scoring.total, 0, 'and nothing banks afterwards either');
+  },
+  'R keeps the lap timer running and the Checkpoint progress'() {
+    const { config, state } = fresh({}, true);
+    passCheckpoints(state, config, 2);
+    const startTime = state.lap.startTime, lapTimeBefore = sim.currentLapTime(state);
+    sim.step(state, pressR, DT, config);
+    assert.strictEqual(state.lap.started, true);
+    assert.strictEqual(state.lap.startTime, startTime, 'the timer must not restart');
+    assert.strictEqual(state.lap.nextCheckpoint, 2);
+    run(state, config, idle, 1);
+    assert(sim.currentLapTime(state) > lapTimeBefore + 0.9, 'the lap time keeps counting up');
+  },
+  'the jump back is not mistaken for driving across a line'() {
+    const { config, state } = fresh({}, true);
+    passCheckpoints(state, config, sim.CIRCUIT.checkpoints.length);
+    assert.strictEqual(state.lap.nextCheckpoint, sim.CIRCUIT.checkpoints.length);
+    sim.step(state, pressR, DT, config);                  // jumps back from near the line to the last Checkpoint
+    assert.strictEqual(state.lap.count, 0, 'jumping must not finish or start anything');
+    walk(state, config, [...along(N() - 20, N() - 1), ...along(N(), N() + 2)]);   // now really drive to the line
+    assert.strictEqual(state.lap.count, 1);
+  },
+  'holding R respawns once, not over and over'() {
+    const { config, state } = fresh({}, true);
+    passCheckpoints(state, config, 1);
+    sim.step(state, pressR, DT, config);
+    state.car.x += 120; state.car.y += 120;
+    const moved = { x: state.car.x, y: state.car.y };
+    sim.step(state, pressR, DT, config);                  // key still held
+    assert(Math.hypot(state.car.x - moved.x, state.car.y - moved.y) < 5, 'a held key must not respawn again');
+    sim.step(state, idle, DT, config);                    // release
+    state.car.x += 50;
+    sim.step(state, pressR, DT, config);                  // press again
+    const cp = sim.CIRCUIT.checkpoints[0];
+    assert(Math.hypot(state.car.x - cp.x, state.car.y - cp.y) < 5);
+  },
+  'R does not touch Total Score, best chain, or crash counts'() {
+    const { config, state } = fresh({}, true);
+    state.scoring.total = 500; state.scoring.bestChain = 120; state.crashCount = 2;
+    sim.step(state, pressR, DT, config);
+    assert.strictEqual(state.scoring.total, 500);
+    assert.strictEqual(state.scoring.bestChain, 120);
+    assert.strictEqual(state.crashCount, 2);
+  },
+  'Records keep the best lap and the best score, and only ever improve'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint()]);
+    walk(state, config, fullLap(), 1 / 30);
+    const first = state.lap.bestLapTime;
+    assert.strictEqual(state.records.bestLap, first);
+    walk(state, config, [...along(3, N() - 1), ...along(N(), N() + 2)], 1 / 15);   // a slower lap
+    assert.strictEqual(state.records.bestLap, first, 'a slower lap is not a Record');
+    state.scoring.total = 900; sim.step(state, idle, DT, config);
+    state.scoring.total = 400; sim.step(state, idle, DT, config);
+    assert.strictEqual(state.records.bestScore, 900);
+  },
+  'a new game starts from saved Records, and only a faster lap beats the saved best lap'() {
+    const config = { ...sim.CONFIG };
+    const saved = { bestLap: 5, bestScore: 777 };
+    const state = sim.createGameState(config, { ...saved });
+    assert.strictEqual(state.records.bestScore, 777);
+    assert.strictEqual(state.lap.bestLapTime, 5);
+    walk(state, config, [spawnPoint()]);
+    walk(state, config, fullLap(), 1 / 30);               // far slower than 5 s
+    assert.strictEqual(state.records.bestLap, 5, 'the saved best lap must stand');
+    assert.strictEqual(state.lap.bestLapTime, 5);
+  },
+  'saved Records are read back safely, whatever is in storage'() {
+    const empty = sim.createRecords();
+    assert.deepStrictEqual(sim.parseRecords(JSON.stringify({ bestLap: 61.234, bestScore: 4321 })), { bestLap: 61.234, bestScore: 4321 });
+    for (const bad of [null, '', 'not json', '[]', '{}', '{"bestLap":"fast","bestScore":"lots"}', '{"bestLap":-4,"bestScore":-9}', '{"bestLap":null,"bestScore":null}', '{"bestLap":1e999,"bestScore":NaN}', '{"bestLap":1e-9,"bestScore":1e300}', '{"bestLap":0.2,"bestScore":0}']) {
+      assert.deepStrictEqual(sim.parseRecords(bad), empty, 'bad data should give empty Records: ' + bad);
+    }
+    assert.deepStrictEqual(sim.parseRecords('{"bestLap":42,"bestScore":"x"}'), { bestLap: 42, bestScore: 0 });
   }
 });
 

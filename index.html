@@ -112,7 +112,7 @@ const PRESETS = {
 <body>
 <canvas id="game"></canvas>
 <div id="hudScore"><div class="small">SCORE</div><div class="big" id="hudTotal">0</div>
-  <div class="chain" id="hudChain"></div><div class="small" id="hudBest">Best chain 0</div></div>
+  <div class="chain" id="hudChain"></div><div class="small" id="hudBest">Best chain 0</div><div class="small" id="hudBestScore">Best score 0</div></div>
 <div id="hudLap"><div class="small" id="hudLapNo">LAP 1</div><div class="big" id="hudLapTime">--:--.---</div>
   <div class="small" id="hudLapLast">Last --:--.---</div><div class="small" id="hudLapBest">Best --:--.---</div><div class="small" id="hudLapCp"></div></div>
 <div id="hud"><div><span class="big" id="hudSpeed">0</span> <span class="small">km/h</span></div><div class="small" id="hudDrift"></div></div>
@@ -121,17 +121,18 @@ const PRESETS = {
 /* ==================================================================
    INPUT - keyboard state. Driving keys never scroll the page.
    ================================================================== */
-const input = { gas: false, brake: false, left: false, right: false, handbrake: false };
+const input = { gas: false, brake: false, left: false, right: false, handbrake: false, respawn: false };
 const KEY_MAP = {
   KeyW: 'gas', ArrowUp: 'gas',
   KeyS: 'brake', ArrowDown: 'brake',
   KeyA: 'left', ArrowLeft: 'left',
   KeyD: 'right', ArrowRight: 'right',
-  Space: 'handbrake'
+  Space: 'handbrake',
+  KeyR: 'respawn'
 };
 window.addEventListener('keydown', e => {
   const k = KEY_MAP[e.code];
-  if (!k) return;
+  if (!k || e.metaKey || e.ctrlKey || e.altKey) return;   // leave browser shortcuts like Cmd+R alone
   e.preventDefault();
   input[k] = true;
 });
@@ -469,20 +470,79 @@ function updateLap(state) {
   }
 }
 
-function createGameState(config) {
-  const c = CIRCUIT.start;
-  const car = createCarState(config, c.x - c.tx * START_SETBACK, c.y - c.ty * START_SETBACK, Math.atan2(c.ty, c.tx));
+/* ---- Records: best lap and best score, kept between visits ---- */
+
+function createRecords() { return { bestLap: null, bestScore: 0 }; }
+
+const MIN_SAVED_LAP = 1, MAX_SAVED_LAP = 3600;   // seconds: a saved best lap outside this is not believable
+const MAX_SAVED_SCORE = 1e9;                      // points: likewise for a saved best score
+
+const isNumberBetween = (v, lo, hi) => typeof v === 'number' && isFinite(v) && v >= lo && v <= hi;
+
+// Reads saved Records back, ignoring anything that is not a believable number.
+function parseRecords(text) {
+  const records = createRecords();
+  try {
+    const saved = JSON.parse(text);
+    if (saved && typeof saved === 'object') {
+      if (isNumberBetween(saved.bestLap, MIN_SAVED_LAP, MAX_SAVED_LAP)) records.bestLap = saved.bestLap;
+      if (isNumberBetween(saved.bestScore, 1, MAX_SAVED_SCORE)) records.bestScore = saved.bestScore;
+    }
+  } catch (e) { /* nothing saved, or damaged: start empty */ }
+  return records;
+}
+
+// Records only ever improve.
+function updateRecords(state) {
+  const records = state.records, best = state.lap.bestLapTime, total = state.scoring.total;
+  if (best !== null && (records.bestLap === null || best < records.bestLap)) records.bestLap = best;
+  if (total > records.bestScore) records.bestScore = total;
+}
+
+/* ---- Respawn (R): back to the last passed Checkpoint, or the start ---- */
+
+// The start position: just behind the start/finish line, facing along the road.
+function startSpot(circuit) {
+  const line = circuit.start;
+  return { x: line.x - line.tx * START_SETBACK, y: line.y - line.ty * START_SETBACK, tx: line.tx, ty: line.ty };
+}
+
+// Where R puts the car: the last passed Checkpoint, or the start position if there is none.
+function respawnSpot(state) {
+  const lap = state.lap, circuit = state.circuit;
+  return lap.nextCheckpoint > 0 ? circuit.checkpoints[lap.nextCheckpoint - 1] : startSpot(circuit);
+}
+
+// Stationary at the spot, facing along the road. The pending Drift Chain is ended without
+// banking, but the lap timer and Checkpoint progress carry on. The jump is not driving, so
+// the lap code is told where the car now is, and skid marks are not joined across it.
+function respawnCar(state, config) {
+  const car = state.car, spot = respawnSpot(state);
+  car.x = spot.x; car.y = spot.y; car.heading = Math.atan2(spot.ty, spot.tx);
+  car.vx = 0; car.vy = 0; car.grip = config.normalGrip;
+  car.drifting = false; car.slipAngle = 0;
+  state.lap.lastX = car.x; state.lap.lastY = car.y;
+  state.effects.wheels = [null, null];
+  resetChain(state.scoring);
+}
+
+function createGameState(config, records = createRecords()) {
+  const spot = startSpot(CIRCUIT);
+  const car = createCarState(config, spot.x, spot.y, Math.atan2(spot.ty, spot.tx));
   car.surface = 'road';       // 'road' or 'grass'
   const lap = createLap();
   lap.lastX = car.x; lap.lastY = car.y;
+  lap.bestLapTime = records.bestLap;   // the saved best lap is the time to beat
   return {
-    time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0, scoring: createScoring(), lap,
+    time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0, scoring: createScoring(), lap, records, respawnHeld: false,
     effects: { smoke: [], skids: [], wheels: [null, null], smokeCarry: 0, seed: 1 }
   };
 }
 
 // Advance the whole game by dt seconds.
 function step(state, inp, dt, config) {
+  if (inp.respawn && !state.respawnHeld) respawnCar(state, config);   // once per key press
+  state.respawnHeld = !!inp.respawn;
   stepCar(state.car, inp, dt, config);
   applyGrass(state.car, state.circuit, dt, config);
   collideWithWall(state, dt, config);
@@ -490,13 +550,30 @@ function step(state, inp, dt, config) {
   updateScoring(state, dt, config);
   state.time += dt;
   updateLap(state);
+  updateRecords(state);
   updateEffects(state, dt);
 }
 // @sim-end
 
 const PX_TO_KMH = 0.18;  // display only: converts pixels per second to km/h-style units
 const MAX_SUBSTEP = 1 / 120;
-const game = createGameState(CONFIG);
+/* ---- Persistence: Records live under their own key, apart from the Tuning Panel's values ---- */
+const RECORDS_KEY = 'drift.records.v1';
+function loadRecords() {
+  try { return parseRecords(localStorage.getItem(RECORDS_KEY)); } catch (e) { return createRecords(); }
+}
+let savedRecords = '';
+function saveRecordsIfChanged() {
+  const text = JSON.stringify(game.records);
+  if (text === savedRecords) return;
+  try {
+    localStorage.setItem(RECORDS_KEY, text);
+    savedRecords = text;   // only once it is really saved, so a failed write is tried again
+  } catch (e) { /* storage unavailable: try again on a later frame */ }
+}
+
+const game = createGameState(CONFIG, loadRecords());
+savedRecords = JSON.stringify(game.records);
 
 /* ==================================================================
    RENDERING - canvas drawing, camera, HUD.
@@ -508,6 +585,7 @@ const hudDrift = document.getElementById('hudDrift');
 const hudTotal = document.getElementById('hudTotal');
 const hudChain = document.getElementById('hudChain');
 const hudBest = document.getElementById('hudBest');
+const hudBestScore = document.getElementById('hudBestScore');
 const hudLapNo = document.getElementById('hudLapNo');
 const hudLapTime = document.getElementById('hudLapTime');
 const hudLapLast = document.getElementById('hudLapLast');
@@ -679,6 +757,7 @@ function render() {
   hudTotal.textContent = formatPoints(sc.total);
   hudChain.textContent = sc.pending > 0 ? '+' + formatPoints(sc.pending) + '  \u00d7' + sc.multiplier : '';
   hudBest.textContent = 'Best chain ' + formatPoints(sc.bestChain);
+  hudBestScore.textContent = 'Best score ' + formatPoints(game.records.bestScore);
   const lap = game.lap;
   hudLapNo.textContent = lap.started ? 'LAP ' + (lap.count + 1) : 'CROSS THE LINE TO START';
   hudLapTime.textContent = lap.started ? formatTime(currentLapTime(game)) : '--:--.---';
@@ -698,6 +777,7 @@ function frame(now) {
   const steps = Math.max(1, Math.ceil(dt / MAX_SUBSTEP));
   for (let i = 0; i < steps; i++) step(game, input, dt / steps, CONFIG);
   updateCamera(dt);
+  saveRecordsIfChanged();
   render();
   requestAnimationFrame(frame);
 }
