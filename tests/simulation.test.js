@@ -6,7 +6,7 @@ const assert = require('assert');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const code = [...html.matchAll(/\/\/ @sim-begin([\s\S]*?)\/\/ @sim-end/g)].map(m => m[1]).join('\n');
-const sim = new Function(code + '\nreturn { CONFIG, DEFAULT_CONFIG, CONFIG_META, PRESETS, createGameState, step, CIRCUIT, createCircuit, circuitQuery, SKID_LIFE, SKID_MAX };')();
+const sim = new Function(code + '\nreturn { CONFIG, DEFAULT_CONFIG, CONFIG_META, PRESETS, createGameState, step, CIRCUIT, createCircuit, circuitQuery, SKID_LIFE, SKID_MAX, currentLapTime };')();
 
 const DT = 1 / 60;
 const idle = { gas: false, brake: false, left: false, right: false, handbrake: false };
@@ -22,6 +22,7 @@ function fresh(overrides = {}, onRealCircuit = false) {
     state.circuit = OPEN_GROUND;
     state.car.x = OPEN_GROUND.start.x; state.car.y = OPEN_GROUND.start.y;
     state.car.heading = Math.atan2(OPEN_GROUND.start.ty, OPEN_GROUND.start.tx);
+    state.lap.lastX = state.car.x; state.lap.lastY = state.car.y;
   }
   return { config, state };
 }
@@ -498,6 +499,131 @@ Object.assign(tests, {
   },
   'the new scoring value has a slider definition'() {
     assert(sim.CONFIG_META.comboStepTime && sim.CONFIG_META.comboStepTime.group === 'Drift Score');
+  }
+});
+
+// ---- Checkpoints and Laps ---------------------------------------------------
+const N = () => sim.CIRCUIT.pts.length;
+const centre = (i, offset = 0) => {
+  const c = sim.CIRCUIT, n = N(), p = c.pts[((i % n) + n) % n], q = c.pts[(((i + 1) % n) + n) % n];
+  const len = Math.hypot(q.x - p.x, q.y - p.y);
+  return { x: p.x - (q.y - p.y) / len * offset, y: p.y + (q.x - p.x) / len * offset };
+};
+// Move the car through the given points one step at a time (so crossings are seen), `dt` seconds apart.
+function walk(state, config, points, dt = DT) {
+  for (const p of points) { state.car.x = p.x; state.car.y = p.y; state.car.vx = state.car.vy = 0; sim.step(state, idle, dt, config); }
+}
+const indices = (from, to) => { const out = []; if (from <= to) for (let i = from; i <= to; i++) out.push(i); else for (let i = from; i >= to; i--) out.push(i); return out; };
+const along = (from, to, offset = 0) => indices(from, to).map(i => centre(i, offset));
+const spawnPoint = () => { const s = sim.CIRCUIT.start; return { x: s.x - s.tx * 80, y: s.y - s.ty * 80 }; };
+// A full forward Lap starting just before the line: spawn, then every sample, then back over the line.
+const fullLap = (offset = 0) => [...along(0, N() - 1, offset), ...along(N(), N() + 2, offset)];
+
+Object.assign(tests, {
+  'the Circuit has ordered Checkpoints spread around the Circuit, away from the start line'() {
+    const cps = sim.CIRCUIT.checkpoints;
+    assert(cps.length >= 4, 'expected several Checkpoints');
+    const gaps = cps.map((c, i) => Math.hypot(c.x - (cps[i + 1] || sim.CIRCUIT.start).x, c.y - (cps[i + 1] || sim.CIRCUIT.start).y));
+    for (const g of gaps) assert(g > 150, 'Checkpoints should be well apart');
+  },
+  'the lap timer does not run until the first forward crossing of the line'() {
+    const { config, state } = fresh({}, true);
+    run(state, config, idle, 2);
+    assert.strictEqual(state.lap.started, false);
+    assert.strictEqual(sim.currentLapTime(state), 0);
+    walk(state, config, [spawnPoint(), centre(0), centre(2)]);
+    assert.strictEqual(state.lap.started, true);
+  },
+  'the timer starts at the first forward crossing, so lap 1 is a flying lap'() {
+    const { config, state } = fresh({}, true);
+    run(state, config, idle, 5);
+    walk(state, config, [spawnPoint(), centre(2)]);
+    const startedAt = state.lap.startTime;
+    walk(state, config, along(3, 40));
+    assert(Math.abs(sim.currentLapTime(state) - (state.time - startedAt)) < 1e-9);
+    assert(sim.currentLapTime(state) < 2, 'time spent sitting on the grid must not count');
+  },
+  'driving forward through every Checkpoint and over the line completes a Lap'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint()]);
+    walk(state, config, fullLap());
+    assert.strictEqual(state.lap.count, 1);
+    assert(state.lap.lastLapTime > 0 && state.lap.lastLapTime === state.lap.bestLapTime);
+    assert.strictEqual(state.lap.nextCheckpoint, 0, 'Checkpoints reset for the next lap');
+  },
+  'skipping a Checkpoint means no Lap, even after crossing the line'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint(), ...along(0, 5)]);
+    const n = N(), cp = sim.CIRCUIT.checkpoints.length;
+    assert.strictEqual(state.lap.started, true);
+    // Cut straight from just before the line back to just after it, skipping every Checkpoint.
+    walk(state, config, [...along(n - 3, n - 1), ...along(n, n + 2)]);
+    assert.strictEqual(state.lap.count, 0);
+    assert(state.lap.nextCheckpoint < cp);
+  },
+  'Checkpoints out of order do not count'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint(), ...along(0, 5)]);
+    const c = sim.CIRCUIT, second = c.checkpoints[1];
+    const idx = c.pts.findIndex(p => Math.hypot(p.x - second.x, p.y - second.y) < 1);
+    walk(state, config, [centre(idx - 2), centre(idx + 2)]);   // cross the second Checkpoint while the first is still due
+    assert.strictEqual(state.lap.nextCheckpoint, 0, 'the second Checkpoint must not count before the first');
+    // finish the loop without the first Checkpoint: crossing back over the line gives no Lap
+    walk(state, config, [...along(idx + 3, N() - 1), ...along(N(), N() + 2)]);
+    assert.strictEqual(state.lap.count, 0);
+  },
+  'backward crossings of a Checkpoint or the line count for nothing'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint(), ...along(0, 3)]);
+    // drive backward over the line, and forward again: no Lap, still started, no double counting
+    walk(state, config, [...along(3, -3), ...along(-3, 3)]);
+    assert.strictEqual(state.lap.count, 0);
+    assert.strictEqual(state.lap.started, true);
+    // collect the first Checkpoint, then reverse over it
+    const first = sim.CIRCUIT.checkpoints[0];
+    const idx = sim.CIRCUIT.pts.findIndex(p => Math.hypot(p.x - first.x, p.y - first.y) < 1);
+    walk(state, config, along(3, idx + 3));
+    assert.strictEqual(state.lap.nextCheckpoint, 1);
+    walk(state, config, along(idx + 3, idx - 3));          // back over it
+    assert.strictEqual(state.lap.nextCheckpoint, 1, 'reversing over a Checkpoint must not un-collect it or count again');
+    walk(state, config, along(idx - 3, idx + 3));          // forward over it again
+    assert.strictEqual(state.lap.nextCheckpoint, 1, 'the same Checkpoint does not count twice');
+  },
+  'reversing over the line before the timer has started does nothing'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint(), ...along(-1, -6)]);
+    assert.strictEqual(state.lap.started, false);
+    assert.strictEqual(state.lap.count, 0);
+  },
+  'driving a lap on the grass verge still counts, because only Checkpoints guard the lap'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint()]);
+    walk(state, config, fullLap(sim.CIRCUIT.halfRoad + 30));
+    assert.strictEqual(state.lap.count, 1);
+  },
+  'best lap is the quickest lap, last lap is the most recent'() {
+    const { config, state } = fresh({}, true);
+    walk(state, config, [spawnPoint()]);
+    walk(state, config, fullLap(), 1 / 30);           // slow lap
+    const slow = state.lap.lastLapTime;
+    walk(state, config, along(3, N() - 1), 1 / 120);  // quick lap
+    walk(state, config, along(N(), N() + 2), 1 / 120);
+    assert.strictEqual(state.lap.count, 2);
+    assert(state.lap.lastLapTime < slow);
+    assert.strictEqual(state.lap.bestLapTime, state.lap.lastLapTime);
+    walk(state, config, along(3, N() - 1), 1 / 15);   // a slower third lap must not replace the best
+    walk(state, config, along(N(), N() + 2), 1 / 15);
+    assert.strictEqual(state.lap.count, 3);
+    assert(state.lap.lastLapTime > state.lap.bestLapTime);
+    assert.strictEqual(state.lap.bestLapTime, Math.min(slow, state.lap.bestLapTime));
+  },
+  'laps do not affect Drift scoring'() {
+    const { config, state } = fresh({}, true);
+    state.scoring.total = 123;
+    walk(state, config, [spawnPoint()]);
+    walk(state, config, fullLap());
+    assert.strictEqual(state.lap.count, 1);
+    assert.strictEqual(state.scoring.total, 123);
   }
 });
 
