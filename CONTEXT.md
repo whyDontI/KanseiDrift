@@ -19,8 +19,12 @@ Pressing R puts the car back, stationary, at the last passed Checkpoint (or the 
 _Avoid_: Reset (that is the Tuning Panel's button), restart
 
 **Tuning Panel**:
-The floating overlay of sliders that changes the car's handling values live while driving.
+The floating overlay of sliders that changes the car's handling values live while driving. It is for developers only: Players never see it, and it is only available in Dev Mode.
 _Avoid_: Settings, debug menu
+
+**Dev Mode**:
+A way for the developers to switch on the Tuning Panel for their own testing; everyone else always gets the standard handling.
+_Avoid_: Debug mode, admin mode
 
 ### Scoring
 
@@ -75,6 +79,10 @@ The persisted best lap time and best score, stored separately from tuning values
 _Avoid_: High scores (when meaning lap time too)
 
 ### Multiplayer
+
+**Landing Page**:
+The first screen of the game, with a Play button for Single Player and a button to create or join a Room.
+_Avoid_: Home screen, main menu
 
 **Room**:
 A private online session that people join with a short room code, shared as a Join Link.
