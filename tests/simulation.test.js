@@ -516,11 +516,11 @@ function walk(state, config, points, dt = DT) {
 const indices = (from, to) => { const out = []; if (from <= to) for (let i = from; i <= to; i++) out.push(i); else for (let i = from; i >= to; i--) out.push(i); return out; };
 const along = (from, to, offset = 0) => indices(from, to).map(i => centre(i, offset));
 const spawnPoint = () => { const s = sim.CIRCUIT.start; return { x: s.x - s.tx * 80, y: s.y - s.ty * 80 }; };
-// A full forward lap starting just before the line: spawn, then every sample, then back over the line.
+// A full forward Lap starting just before the line: spawn, then every sample, then back over the line.
 const fullLap = (offset = 0) => [...along(0, N() - 1, offset), ...along(N(), N() + 2, offset)];
 
 Object.assign(tests, {
-  'the Circuit has ordered Checkpoints spread around the loop, away from the start line'() {
+  'the Circuit has ordered Checkpoints spread around the Circuit, away from the start line'() {
     const cps = sim.CIRCUIT.checkpoints;
     assert(cps.length >= 4, 'expected several Checkpoints');
     const gaps = cps.map((c, i) => Math.hypot(c.x - (cps[i + 1] || sim.CIRCUIT.start).x, c.y - (cps[i + 1] || sim.CIRCUIT.start).y));
@@ -543,7 +543,7 @@ Object.assign(tests, {
     assert(Math.abs(sim.currentLapTime(state) - (state.time - startedAt)) < 1e-9);
     assert(sim.currentLapTime(state) < 2, 'time spent sitting on the grid must not count');
   },
-  'driving the loop forward through every Checkpoint completes a Lap'() {
+  'driving forward through every Checkpoint and over the line completes a Lap'() {
     const { config, state } = fresh({}, true);
     walk(state, config, [spawnPoint()]);
     walk(state, config, fullLap());
@@ -566,7 +566,7 @@ Object.assign(tests, {
     walk(state, config, [spawnPoint(), ...along(0, 5)]);
     const c = sim.CIRCUIT, second = c.checkpoints[1];
     const idx = c.pts.findIndex(p => Math.hypot(p.x - second.x, p.y - second.y) < 1);
-    walk(state, config, [centre(idx - 2), centre(idx + 2)]);   // cross the second gate while the first is still due
+    walk(state, config, [centre(idx - 2), centre(idx + 2)]);   // cross the second Checkpoint while the first is still due
     assert.strictEqual(state.lap.nextCheckpoint, 0, 'the second Checkpoint must not count before the first');
     // finish the loop without the first Checkpoint: crossing back over the line gives no Lap
     walk(state, config, [...along(idx + 3, N() - 1), ...along(N(), N() + 2)]);
