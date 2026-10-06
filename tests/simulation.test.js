@@ -58,6 +58,18 @@ const tests = {
     assert(fwd > config.maxSpeed * 0.8, 'should reach most of top speed');
     assert(fwd <= config.maxSpeed + 1, 'must not exceed maxSpeed');
   },
+  'top speed is the lower of maxSpeed and what drag allows (about acceleration / friction)'() {
+    const topSpeed = overrides => {
+      const { config, state } = fresh(overrides);
+      let best = 0;
+      for (let t = 0; t < 25; t += DT) { sim.step(state, { ...idle, gas: true }, DT, config); best = Math.max(best, Math.hypot(state.car.vx, state.car.vy)); }
+      return best;
+    };
+    assert(Math.abs(topSpeed({ maxSpeed: 300 }) - 300) < 10, 'a low maxSpeed is the limit');
+    const dragLimit = sim.CONFIG.acceleration / sim.CONFIG.friction;
+    assert(Math.abs(topSpeed({ maxSpeed: 1200 }) - dragLimit) < 10, 'a very high maxSpeed is limited by drag');
+    assert(topSpeed({ maxSpeed: 1200, acceleration: 1000 }) > dragLimit * 1.4, 'more acceleration lifts that limit');
+  },
   'car cannot turn while stationary'() {
     const { config, state } = fresh();
     const before = state.car.heading;
@@ -743,6 +755,47 @@ Object.assign(tests, {
       assert.deepStrictEqual(sim.parseRecords(bad), empty, 'bad data should give empty Records: ' + bad);
     }
     assert.deepStrictEqual(sim.parseRecords('{"bestLap":42,"bestScore":"x"}'), { bestLap: 42, bestScore: 0 });
+  }
+});
+
+// ---- Whole-game check: can the Circuit actually be driven? -------------------
+const wrapAngle = a => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
+
+// A simple autopilot: steer toward a point ahead on the centreline, slow down for bends.
+function autopilot(state, config) {
+  const pts = state.circuit.pts, n = pts.length, car = state.car;
+  const start = sim.circuitQuery(state.circuit, car.x, car.y).index;
+  const ahead = distance => {
+    let i = start, travelled = 0;
+    while (travelled < distance) { const a = pts[i % n], b = pts[(i + 1) % n]; travelled += Math.hypot(b.x - a.x, b.y - a.y); i++; }
+    return pts[i % n];
+  };
+  const aim = ahead(160), near = ahead(40), far = ahead(350);
+  const steerError = wrapAngle(Math.atan2(aim.y - car.y, aim.x - car.x) - car.heading);
+  const bend = Math.abs(wrapAngle(Math.atan2(far.y - near.y, far.x - near.x) - Math.atan2(near.y - car.y, near.x - car.x)));
+  const wanted = Math.max(200, config.maxSpeed - bend * 500), speed = Math.hypot(car.vx, car.vy);
+  return { gas: speed < wanted, brake: speed > wanted + 40, left: steerError < -0.04, right: steerError > 0.04, handbrake: false, respawn: false };
+}
+
+Object.assign(tests, {
+  'the Circuit can be driven: an autopilot completes a Lap through every Checkpoint without hitting a Wall'() {
+    const { config, state } = fresh({}, true);
+    let seconds = 0;
+    while (seconds < 120 && state.lap.count < 1) { sim.step(state, autopilot(state, config), DT, config); seconds += DT; }
+    assert.strictEqual(state.lap.count, 1, 'the autopilot should finish a Lap within two minutes');
+    assert.strictEqual(state.crashCount, 0, 'a careful driver should not crash');
+    assert(state.lap.lastLapTime > 8 && state.lap.lastLapTime < 60, 'lap time ' + state.lap.lastLapTime);
+    assert.strictEqual(state.records.bestLap, state.lap.lastLapTime, 'the lap becomes the Record');
+  },
+  'driving across the infield instead of round the Circuit never completes a Lap'() {
+    const { config, state } = fresh({}, true);
+    // Always aim at the start line from wherever the car is: a straight-line shortcut, never passing Checkpoints.
+    const c = state.circuit;
+    for (let t = 0; t < 60; t += DT) {
+      const err = wrapAngle(Math.atan2(c.start.y - state.car.y, c.start.x - state.car.x) - state.car.heading);
+      sim.step(state, { ...idle, gas: true, left: err < -0.05, right: err > 0.05 }, DT, config);
+    }
+    assert.strictEqual(state.lap.count, 0);
   }
 });
 

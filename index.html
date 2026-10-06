@@ -12,10 +12,10 @@
 // @sim-begin
 const CONFIG = {
   // --- Speed ---
-  maxSpeed: 620,          // top forward speed in pixels per second
+  maxSpeed: 620,          // top forward speed in pixels per second (drag also caps it near acceleration / friction)
   acceleration: 520,      // how fast gas adds speed (px/s per second)
   brakePower: 950,        // how hard brake slows you down (px/s per second)
-  friction: 0.7,          // rolling drag: share of speed lost per second with no gas
+  friction: 0.7,          // drag: share of speed lost per second (also limits top speed with the gas held)
   crashSpeed: 260,        // speed into a wall (px/s) above which a hit is a Crash, not a Scrape
   grassDrag: 1.6,         // extra drag per second while the car is mostly on grass
   wallBounce: 0.2,        // share of the speed into a wall that bounces back
@@ -102,6 +102,7 @@ const PRESETS = {
   #panel .row .top { display: flex; justify-content: space-between; }
   #panel .row .val { font-variant-numeric: tabular-nums; color: #fff; }
   #panel input[type=range] { width: 100%; margin: 2px 0 0; }
+  #panel .range { display: flex; justify-content: space-between; font-size: 10px; opacity: .55; font-variant-numeric: tabular-nums; }
   #panel .actions { display: flex; gap: 6px; margin-top: 10px; }
   #panel .actions button, #panel select { flex: 1; background: rgba(255,255,255,.12); color: #fff; border: 1px solid rgba(255,255,255,.2);
     border-radius: 4px; padding: 5px 6px; font-size: 12px; cursor: pointer; }
@@ -197,7 +198,8 @@ function stepCar(car, inp, dt, config) {
     if (fwd > 0) fwd = Math.max(0, fwd - config.brakePower * dt);
     else fwd = Math.max(-config.maxSpeed * REVERSE_SPEED_SHARE, fwd - config.acceleration * dt);
   }
-  // Rolling drag, plus a little extra bleed under handbrake.
+  // Drag, plus a little extra bleed under handbrake. It acts even with the gas held, so the
+  // real top speed is the lower of maxSpeed and about acceleration / friction.
   fwd -= fwd * Math.min(1, (config.friction + (inp.handbrake ? HANDBRAKE_DRAG : 0)) * dt);
 
   // Grip eases toward its target: drops fast, recovers at gripRecoverySpeed.
@@ -831,7 +833,8 @@ requestAnimationFrame(frame);
       const decimals = decimalsOf(m.step);
       const input = el('input', { type: 'range', min: m.min, max: m.max, step: m.step, value: CONFIG[key] });
       const value = el('span', { className: 'val', textContent: CONFIG[key].toFixed(decimals) });
-      body.appendChild(el('div', { className: 'row' }, [el('div', { className: 'top' }, [el('span', { textContent: key }), value]), input]));
+      const range = el('div', { className: 'range' }, [el('span', { textContent: String(m.min) }), el('span', { textContent: String(m.max) })]);
+      body.appendChild(el('div', { className: 'row' }, [el('div', { className: 'top' }, [el('span', { textContent: key }), value]), input, range]));
       sliders[key] = { input, value, decimals };
       input.addEventListener('input', () => {
         CONFIG[key] = roundToStep(key, Number(input.value));
