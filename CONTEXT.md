@@ -14,6 +14,10 @@ _Avoid_: Slide, skid (a skid is the mark left on the ground, not the state)
 The angle between where the car points and where it is travelling; a Drift starts when it passes the entry angle and ends when it falls below the lower exit angle.
 _Avoid_: Drift angle, side angle
 
+**Respawn**:
+Pressing R puts the car back, stationary, at the last passed Checkpoint (or the start if none), ending any pending Drift Chain without Banking it while the lap timer keeps running.
+_Avoid_: Reset (that is the Tuning Panel's button), restart
+
 **Tuning Panel**:
 The floating overlay of sliders that changes the car's handling values live while driving.
 _Avoid_: Settings, debug menu

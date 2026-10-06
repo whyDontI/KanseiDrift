@@ -474,14 +474,19 @@ function updateLap(state) {
 
 function createRecords() { return { bestLap: null, bestScore: 0 }; }
 
-// Reads saved Records back, ignoring anything that is not a sensible number.
+const MIN_SAVED_LAP = 1, MAX_SAVED_LAP = 3600;   // seconds: a saved best lap outside this is not believable
+const MAX_SAVED_SCORE = 1e9;                      // points: likewise for a saved best score
+
+const isNumberBetween = (v, lo, hi) => typeof v === 'number' && isFinite(v) && v >= lo && v <= hi;
+
+// Reads saved Records back, ignoring anything that is not a believable number.
 function parseRecords(text) {
   const records = createRecords();
   try {
     const saved = JSON.parse(text);
     if (saved && typeof saved === 'object') {
-      if (typeof saved.bestLap === 'number' && isFinite(saved.bestLap) && saved.bestLap > 0) records.bestLap = saved.bestLap;
-      if (typeof saved.bestScore === 'number' && isFinite(saved.bestScore) && saved.bestScore > 0) records.bestScore = saved.bestScore;
+      if (isNumberBetween(saved.bestLap, MIN_SAVED_LAP, MAX_SAVED_LAP)) records.bestLap = saved.bestLap;
+      if (isNumberBetween(saved.bestScore, 1, MAX_SAVED_SCORE)) records.bestScore = saved.bestScore;
     }
   } catch (e) { /* nothing saved, or damaged: start empty */ }
   return records;
@@ -496,11 +501,16 @@ function updateRecords(state) {
 
 /* ---- Respawn (R): back to the last passed Checkpoint, or the start ---- */
 
+// The start position: just behind the start/finish line, facing along the road.
+function startSpot(circuit) {
+  const line = circuit.start;
+  return { x: line.x - line.tx * START_SETBACK, y: line.y - line.ty * START_SETBACK, tx: line.tx, ty: line.ty };
+}
+
 // Where R puts the car: the last passed Checkpoint, or the start position if there is none.
 function respawnSpot(state) {
-  const lap = state.lap, c = state.circuit;
-  if (lap.nextCheckpoint > 0) return c.checkpoints[lap.nextCheckpoint - 1];
-  return { x: c.start.x - c.start.tx * START_SETBACK, y: c.start.y - c.start.ty * START_SETBACK, tx: c.start.tx, ty: c.start.ty };
+  const lap = state.lap, circuit = state.circuit;
+  return lap.nextCheckpoint > 0 ? circuit.checkpoints[lap.nextCheckpoint - 1] : startSpot(circuit);
 }
 
 // Stationary at the spot, facing along the road. The pending Drift Chain is ended without
@@ -517,8 +527,8 @@ function respawnCar(state, config) {
 }
 
 function createGameState(config, records = createRecords()) {
-  const c = CIRCUIT.start;
-  const car = createCarState(config, c.x - c.tx * START_SETBACK, c.y - c.ty * START_SETBACK, Math.atan2(c.ty, c.tx));
+  const spot = startSpot(CIRCUIT);
+  const car = createCarState(config, spot.x, spot.y, Math.atan2(spot.ty, spot.tx));
   car.surface = 'road';       // 'road' or 'grass'
   const lap = createLap();
   lap.lastX = car.x; lap.lastY = car.y;
@@ -547,7 +557,7 @@ function step(state, inp, dt, config) {
 
 const PX_TO_KMH = 0.18;  // display only: converts pixels per second to km/h-style units
 const MAX_SUBSTEP = 1 / 120;
-// Records live under their own key, apart from the Tuning Panel's values.
+/* ---- Persistence: Records live under their own key, apart from the Tuning Panel's values ---- */
 const RECORDS_KEY = 'drift.records.v1';
 function loadRecords() {
   try { return parseRecords(localStorage.getItem(RECORDS_KEY)); } catch (e) { return createRecords(); }
@@ -556,8 +566,10 @@ let savedRecords = '';
 function saveRecordsIfChanged() {
   const text = JSON.stringify(game.records);
   if (text === savedRecords) return;
-  savedRecords = text;
-  try { localStorage.setItem(RECORDS_KEY, text); } catch (e) { /* storage unavailable */ }
+  try {
+    localStorage.setItem(RECORDS_KEY, text);
+    savedRecords = text;   // only once it is really saved, so a failed write is tried again
+  } catch (e) { /* storage unavailable: try again on a later frame */ }
 }
 
 const game = createGameState(CONFIG, loadRecords());

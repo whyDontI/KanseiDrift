@@ -739,7 +739,7 @@ Object.assign(tests, {
   'saved Records are read back safely, whatever is in storage'() {
     const empty = sim.createRecords();
     assert.deepStrictEqual(sim.parseRecords(JSON.stringify({ bestLap: 61.234, bestScore: 4321 })), { bestLap: 61.234, bestScore: 4321 });
-    for (const bad of [null, '', 'not json', '[]', '{}', '{"bestLap":"fast","bestScore":"lots"}', '{"bestLap":-4,"bestScore":-9}', '{"bestLap":null,"bestScore":null}', '{"bestLap":1e999,"bestScore":NaN}']) {
+    for (const bad of [null, '', 'not json', '[]', '{}', '{"bestLap":"fast","bestScore":"lots"}', '{"bestLap":-4,"bestScore":-9}', '{"bestLap":null,"bestScore":null}', '{"bestLap":1e999,"bestScore":NaN}', '{"bestLap":1e-9,"bestScore":1e300}', '{"bestLap":0.2,"bestScore":0}']) {
       assert.deepStrictEqual(sim.parseRecords(bad), empty, 'bad data should give empty Records: ' + bad);
     }
     assert.deepStrictEqual(sim.parseRecords('{"bestLap":42,"bestScore":"x"}'), { bestLap: 42, bestScore: 0 });
