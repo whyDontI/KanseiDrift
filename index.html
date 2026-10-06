@@ -28,6 +28,9 @@ const CONFIG = {
   driftGrip: 4.5,         // sideways grip when steering hard at speed (lower = slidier)
   handbrakeGrip: 2.5,     // sideways grip while Space is held
   gripRecoverySpeed: 8,   // how fast grip returns once you straighten up (per second)
+  driftEnterAngle: 15,    // slip angle (degrees) above which a Drift starts
+  driftExitAngle: 8,      // slip angle (degrees) below which a Drift ends (keep below the start angle)
+  minDriftSpeed: 150,     // slowest speed (px/s) at which a Drift can start
   // --- Drift Score ---
   driftScoreRate: 10,     // points per second while drifting (used by scoring)
   comboTimeout: 1.5       // seconds without drifting before the chain ends
@@ -53,6 +56,9 @@ const CONFIG_META = {
   driftGrip:         { group: 'Grip',        min: 0.2,  max: 15,   step: 0.1 },
   handbrakeGrip:     { group: 'Grip',        min: 0.1,  max: 10,   step: 0.1 },
   gripRecoverySpeed: { group: 'Grip',        min: 0.5,  max: 20,   step: 0.5 },
+  driftEnterAngle:   { group: 'Grip',        min: 3,    max: 60,   step: 1 },
+  driftExitAngle:    { group: 'Grip',        min: 1,    max: 45,   step: 1 },
+  minDriftSpeed:     { group: 'Grip',        min: 20,   max: 600,  step: 10 },
   driftScoreRate:    { group: 'Drift Score', min: 1,    max: 100,  step: 1 },
   comboTimeout:      { group: 'Drift Score', min: 0.2,  max: 5,    step: 0.1 }
 };
@@ -96,7 +102,7 @@ const PRESETS = {
 </head>
 <body>
 <canvas id="game"></canvas>
-<div id="hud"><div><span class="big" id="hudSpeed">0</span> <span class="small">km/h</span></div></div>
+<div id="hud"><div><span class="big" id="hudSpeed">0</span> <span class="small">km/h</span></div><div class="small" id="hudDrift"></div></div>
 
 <script>
 /* ==================================================================
@@ -141,7 +147,7 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 function smoothstep(a, b, v) { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
 
 function createCarState(config, x = 0, y = 0, heading = 0) {
-  return { x, y, heading, vx: 0, vy: 0, grip: config.normalGrip };
+  return { x, y, heading, vx: 0, vy: 0, grip: config.normalGrip, slipAngle: 0, drifting: false };
 }
 
 // Grip the car is aiming for this frame.
@@ -249,6 +255,29 @@ function circuitQuery(circuit, x, y) {
 
 function scaleVelocity(car, factor) { car.vx *= factor; car.vy *= factor; }
 
+const DRIFT_STOPPED_SHARE = 0.5;  // a Drift also ends once speed falls below this share of minDriftSpeed
+
+// Slip angle: the angle in degrees between where the car points and where it travels.
+function slipAngleOf(car) {
+  const cos = Math.cos(car.heading), sin = Math.sin(car.heading);
+  const fwd = car.vx * cos + car.vy * sin, lat = -car.vx * sin + car.vy * cos;
+  return Math.atan2(Math.abs(lat), Math.abs(fwd)) * 180 / Math.PI;
+}
+
+// The one Drift flag that smoke, skid marks and scoring all read. It turns on above
+// driftEnterAngle (at minDriftSpeed or faster) and off below driftExitAngle, so it holds
+// steady while the slip angle hovers between the two.
+function updateDrift(car, config) {
+  const speed = Math.hypot(car.vx, car.vy);
+  car.slipAngle = slipAngleOf(car);
+  const exitAngle = Math.min(config.driftExitAngle, config.driftEnterAngle);
+  if (car.drifting) {
+    if (car.slipAngle < exitAngle || speed < config.minDriftSpeed * DRIFT_STOPPED_SHARE) car.drifting = false;
+  } else if (speed >= config.minDriftSpeed && car.slipAngle > config.driftEnterAngle) {
+    car.drifting = true;
+  }
+}
+
 // Grass slows the car whenever it is mostly off the tarmac.
 function applyGrass(car, circuit, dt, config) {
   const nearest = circuitQuery(circuit, car.x, car.y);
@@ -284,11 +313,67 @@ function collideWithWall(state, dt, config) {
    GAME LOGIC - the single simulation step the whole game runs through.
    ================================================================== */
 // @sim-begin
+const SMOKE_PER_SECOND = 45;   // smoke puffs per rear wheel per second while Drifting
+const SMOKE_LIFE = 0.9;        // seconds a puff lasts
+const SKID_LIFE = 25;          // seconds before a skid mark has faded away
+const SKID_MAX = 2500;         // most skid mark segments kept at once
+const SKID_MIN_STEP = 2;       // pixels a wheel must move before a new mark segment is laid
+const REAR_WHEELS = [{ x: -14.5, y: -12 }, { x: -14.5, y: 12 }];   // car-local wheel centres
+const SMOKE_DAMPING = 2;       // how quickly a puff loses its speed (per second)
+const SMOKE_INHERIT = 0.1;     // share of the car's velocity a new puff starts with
+const SMOKE_SPREAD = 40;       // random sideways kick given to a new puff (px/s)
+
+/* ---- Effects: smoke and skid marks (kept DOM-free so the tests can run them) ---- */
+
+// World positions of the car's rear wheels.
+function rearWheelPositions(car) {
+  const cos = Math.cos(car.heading), sin = Math.sin(car.heading);
+  return REAR_WHEELS.map(w => ({ x: car.x + w.x * cos - w.y * sin, y: car.y + w.x * sin + w.y * cos }));
+}
+
+function nextRandom(fx) {   // tiny seeded generator, so effects are repeatable
+  fx.seed = (Math.imul(fx.seed, 1664525) + 1013904223) >>> 0;
+  return fx.seed / 4294967296;
+}
+
+// Smoke and skid marks. Both appear only while the car is Drifting.
+function updateEffects(state, dt) {
+  const fx = state.effects, car = state.car;
+  for (const p of fx.smoke) {
+    const damp = Math.exp(-SMOKE_DAMPING * dt);
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= damp; p.vy *= damp; p.age += dt;
+  }
+  fx.smoke = fx.smoke.filter(p => p.age < SMOKE_LIFE);
+  let expired = 0;
+  while (expired < fx.skids.length && state.time - fx.skids[expired].t > SKID_LIFE) expired++;
+  if (expired) fx.skids.splice(0, expired);
+
+  fx.smokeCarry = car.drifting ? fx.smokeCarry + SMOKE_PER_SECOND * dt : 0;
+  const puffs = Math.floor(fx.smokeCarry);
+  fx.smokeCarry -= puffs;
+  rearWheelPositions(car).forEach(({ x, y }, i) => {
+    if (!car.drifting) { fx.wheels[i] = null; return; }
+    const prev = fx.wheels[i];
+    if (!prev) fx.wheels[i] = { x, y };
+    else if (Math.hypot(x - prev.x, y - prev.y) >= SKID_MIN_STEP) {
+      fx.skids.push({ x1: prev.x, y1: prev.y, x2: x, y2: y, t: state.time });
+      fx.wheels[i] = { x, y };
+    }
+    for (let n = 0; n < puffs; n++) {
+      fx.smoke.push({ x, y, vx: car.vx * SMOKE_INHERIT + (nextRandom(fx) - 0.5) * SMOKE_SPREAD, vy: car.vy * SMOKE_INHERIT + (nextRandom(fx) - 0.5) * SMOKE_SPREAD, age: 0 });
+    }
+  });
+  if (fx.skids.length > SKID_MAX) fx.skids.splice(0, fx.skids.length - SKID_MAX);
+}
+
 function createGameState(config) {
   const c = CIRCUIT.start;
   const car = createCarState(config, c.x - c.tx * START_SETBACK, c.y - c.ty * START_SETBACK, Math.atan2(c.ty, c.tx));
   car.surface = 'road';       // 'road' or 'grass'
-  return { time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0 };
+  return {
+    time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0,
+    effects: { smoke: [], skids: [], wheels: [null, null], smokeCarry: 0, seed: 1 }
+  };
 }
 
 // Advance the whole game by dt seconds.
@@ -296,7 +381,9 @@ function step(state, inp, dt, config) {
   stepCar(state.car, inp, dt, config);
   applyGrass(state.car, state.circuit, dt, config);
   collideWithWall(state, dt, config);
+  updateDrift(state.car, config);
   state.time += dt;
+  updateEffects(state, dt);
 }
 // @sim-end
 
@@ -310,6 +397,7 @@ const game = createGameState(CONFIG);
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const hudSpeed = document.getElementById('hudSpeed');
+const hudDrift = document.getElementById('hudDrift');
 const camera = { x: 0, y: 0 };
 const CAMERA_LOOKAHEAD = 0.3;   // seconds of velocity the camera leads by
 const CAMERA_STIFFNESS = 5;     // how tightly the camera follows (higher = snappier)
@@ -388,6 +476,37 @@ function drawCircuit() {
   ctx.restore();
 }
 
+// Skid marks fade out over SKID_LIFE seconds. Segments are batched into a few
+// opacity levels so thousands of them cost only a handful of draw calls.
+const SKID_FADE_LEVELS = 8;
+function drawSkids() {
+  const buckets = Array.from({ length: SKID_FADE_LEVELS }, () => []);
+  for (const m of game.effects.skids) {
+    const fade = 1 - (game.time - m.t) / SKID_LIFE;
+    if (fade > 0) buckets[Math.min(SKID_FADE_LEVELS - 1, Math.floor(fade * SKID_FADE_LEVELS))].push(m);
+  }
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 4;
+  buckets.forEach((marks, level) => {
+    if (!marks.length) return;
+    ctx.strokeStyle = 'rgba(12,12,14,' + (0.55 * (level + 0.5) / SKID_FADE_LEVELS).toFixed(3) + ')';
+    ctx.beginPath();
+    for (const m of marks) { ctx.moveTo(m.x1, m.y1); ctx.lineTo(m.x2, m.y2); }
+    ctx.stroke();
+  });
+}
+
+// Smoke puffs grow and thin out as they age.
+function drawSmoke() {
+  for (const p of game.effects.smoke) {
+    const life = p.age / SMOKE_LIFE;
+    ctx.fillStyle = 'rgba(235,235,238,' + (0.42 * (1 - life)).toFixed(3) + ')';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 6 + 18 * life, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
 function drawCar() {
   const car = game.car;
   ctx.save();
@@ -414,10 +533,13 @@ function render() {
   ctx.translate(w / 2 - camera.x, h / 2 - camera.y);
   drawGround(w, h);
   drawCircuit();
+  drawSkids();
   drawCar();
+  drawSmoke();
   ctx.restore();
   const speed = Math.hypot(game.car.vx, game.car.vy);
   hudSpeed.textContent = Math.round(speed * PX_TO_KMH);
+  hudDrift.textContent = game.car.drifting ? 'DRIFT ' + Math.round(game.car.slipAngle) + '\u00b0' : '';
 }
 
 /* ==================================================================
