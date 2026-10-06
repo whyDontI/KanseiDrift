@@ -32,8 +32,9 @@ const CONFIG = {
   driftExitAngle: 8,      // slip angle (degrees) below which a Drift ends (keep below the start angle)
   minDriftSpeed: 150,     // slowest speed (px/s) at which a Drift can start
   // --- Drift Score ---
-  driftScoreRate: 10,     // points per second while drifting (used by scoring)
-  comboTimeout: 1.5       // seconds without drifting before the chain ends
+  driftScoreRate: 50,     // points per second while drifting (before the Combo Multiplier)
+  comboTimeout: 1.5,      // seconds without drifting before the chain ends
+  comboStepTime: 2        // seconds of Drifting that add +1 to the Combo Multiplier
 };
 
 // ---- Tuning Panel data (kept here, DOM-free, so the tests can reach it) ----
@@ -59,8 +60,9 @@ const CONFIG_META = {
   driftEnterAngle:   { group: 'Grip',        min: 3,    max: 60,   step: 1 },
   driftExitAngle:    { group: 'Grip',        min: 1,    max: 45,   step: 1 },
   minDriftSpeed:     { group: 'Grip',        min: 20,   max: 600,  step: 10 },
-  driftScoreRate:    { group: 'Drift Score', min: 1,    max: 100,  step: 1 },
-  comboTimeout:      { group: 'Drift Score', min: 0.2,  max: 5,    step: 0.1 }
+  driftScoreRate:    { group: 'Drift Score', min: 5,    max: 500,  step: 5 },
+  comboTimeout:      { group: 'Drift Score', min: 0.2,  max: 5,    step: 0.1 },
+  comboStepTime:     { group: 'Drift Score', min: 0.5,  max: 10,   step: 0.5 }
 };
 
 // Presets only set sliders; anything they leave out goes back to the default.
@@ -77,6 +79,10 @@ const PRESETS = {
   #hud { position: fixed; left: 16px; bottom: 16px; color: #fff; text-shadow: 0 1px 3px #000; pointer-events: none; }
   #hud .big { font-size: 40px; font-weight: 700; }
   #hud .small { font-size: 14px; opacity: .8; }
+  #hudScore { position: fixed; left: 16px; top: 16px; color: #fff; text-shadow: 0 1px 3px #000; pointer-events: none; }
+  #hudScore .big { font-size: 34px; font-weight: 700; line-height: 1.1; }
+  #hudScore .small { font-size: 13px; opacity: .8; }
+  #hudScore .chain { font-size: 20px; font-weight: 700; color: #ffd166; min-height: 26px; }
   #gear { position: fixed; top: 12px; right: 12px; width: 36px; height: 36px; border-radius: 50%; border: 0;
     background: rgba(15,18,24,.78); color: #fff; font-size: 20px; line-height: 36px; padding: 0; cursor: pointer; z-index: 11; }
   #gear:hover { background: rgba(40,46,58,.9); }
@@ -102,6 +108,8 @@ const PRESETS = {
 </head>
 <body>
 <canvas id="game"></canvas>
+<div id="hudScore"><div class="small">SCORE</div><div class="big" id="hudTotal">0</div>
+  <div class="chain" id="hudChain"></div><div class="small" id="hudBest">Best chain 0</div></div>
 <div id="hud"><div><span class="big" id="hudSpeed">0</span> <span class="small">km/h</span></div><div class="small" id="hudDrift"></div></div>
 
 <script>
@@ -366,12 +374,45 @@ function updateEffects(state, dt) {
   if (fx.skids.length > SKID_MAX) fx.skids.splice(0, fx.skids.length - SKID_MAX);
 }
 
+/* ---- Scoring: Drift Chains, Combo Multiplier, banking ---- */
+
+function createScoring() {
+  return { total: 0, pending: 0, multiplier: 1, chainTime: 0, idleTime: 0, bestChain: 0, crashesSeen: 0 };
+}
+
+// Ends the current chain without banking it (used after a Crash, and as part of banking).
+function resetChain(sc) { sc.pending = 0; sc.multiplier = 1; sc.chainTime = 0; sc.idleTime = 0; }
+
+function bankChain(sc) {
+  sc.total += sc.pending;
+  sc.bestChain = Math.max(sc.bestChain, sc.pending);
+  resetChain(sc);
+}
+
+// Drifting builds the chain; a pause shorter than comboTimeout does not end it.
+function updateScoring(state, dt, config) {
+  const sc = state.scoring;
+  if (state.crashCount !== sc.crashesSeen) {   // a Crash loses the pending points
+    sc.crashesSeen = state.crashCount;
+    resetChain(sc);
+  }
+  if (state.car.drifting) {
+    sc.idleTime = 0;
+    sc.chainTime += dt;
+    sc.multiplier = 1 + Math.floor(sc.chainTime / config.comboStepTime);
+    sc.pending += config.driftScoreRate * sc.multiplier * dt;
+  } else if (sc.pending > 0) {
+    sc.idleTime += dt;
+    if (sc.idleTime >= config.comboTimeout) bankChain(sc);
+  }
+}
+
 function createGameState(config) {
   const c = CIRCUIT.start;
   const car = createCarState(config, c.x - c.tx * START_SETBACK, c.y - c.ty * START_SETBACK, Math.atan2(c.ty, c.tx));
   car.surface = 'road';       // 'road' or 'grass'
   return {
-    time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0,
+    time: 0, car, circuit: CIRCUIT, lastImpact: null, crashCount: 0, scrapeCount: 0, scoring: createScoring(),
     effects: { smoke: [], skids: [], wheels: [null, null], smokeCarry: 0, seed: 1 }
   };
 }
@@ -382,6 +423,7 @@ function step(state, inp, dt, config) {
   applyGrass(state.car, state.circuit, dt, config);
   collideWithWall(state, dt, config);
   updateDrift(state.car, config);
+  updateScoring(state, dt, config);
   state.time += dt;
   updateEffects(state, dt);
 }
@@ -398,6 +440,9 @@ const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const hudSpeed = document.getElementById('hudSpeed');
 const hudDrift = document.getElementById('hudDrift');
+const hudTotal = document.getElementById('hudTotal');
+const hudChain = document.getElementById('hudChain');
+const hudBest = document.getElementById('hudBest');
 const camera = { x: 0, y: 0 };
 const CAMERA_LOOKAHEAD = 0.3;   // seconds of velocity the camera leads by
 const CAMERA_STIFFNESS = 5;     // how tightly the camera follows (higher = snappier)
@@ -539,6 +584,10 @@ function render() {
   ctx.restore();
   const speed = Math.hypot(game.car.vx, game.car.vy);
   hudSpeed.textContent = Math.round(speed * PX_TO_KMH);
+  const sc = game.scoring;
+  hudTotal.textContent = Math.floor(sc.total).toLocaleString();
+  hudChain.textContent = sc.pending > 0 ? '+' + Math.floor(sc.pending).toLocaleString() + '  \u00d7' + sc.multiplier : '';
+  hudBest.textContent = 'Best chain ' + Math.floor(sc.bestChain).toLocaleString();
   hudDrift.textContent = game.car.drifting ? 'DRIFT ' + Math.round(game.car.slipAngle) + '\u00b0' : '';
 }
 
