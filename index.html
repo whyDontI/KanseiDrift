@@ -377,11 +377,11 @@ function updateEffects(state, dt) {
 /* ---- Scoring: Drift Chains, Combo Multiplier, banking ---- */
 
 function createScoring() {
-  return { total: 0, pending: 0, multiplier: 1, chainTime: 0, idleTime: 0, bestChain: 0, crashesSeen: 0 };
+  return { total: 0, pending: 0, multiplier: 1, chainTime: 0, timeSinceDrift: 0, bestChain: 0, crashesSeen: 0 };
 }
 
 // Ends the current chain without banking it (used after a Crash, and as part of banking).
-function resetChain(sc) { sc.pending = 0; sc.multiplier = 1; sc.chainTime = 0; sc.idleTime = 0; }
+function resetChain(sc) { sc.pending = 0; sc.multiplier = 1; sc.chainTime = 0; sc.timeSinceDrift = 0; }
 
 function bankChain(sc) {
   sc.total += sc.pending;
@@ -397,13 +397,13 @@ function updateScoring(state, dt, config) {
     resetChain(sc);
   }
   if (state.car.drifting) {
-    sc.idleTime = 0;
+    sc.timeSinceDrift = 0;
     sc.chainTime += dt;
     sc.multiplier = 1 + Math.floor(sc.chainTime / config.comboStepTime);
     sc.pending += config.driftScoreRate * sc.multiplier * dt;
   } else if (sc.pending > 0) {
-    sc.idleTime += dt;
-    if (sc.idleTime >= config.comboTimeout) bankChain(sc);
+    sc.timeSinceDrift += dt;
+    if (sc.timeSinceDrift >= config.comboTimeout) bankChain(sc);
   }
 }
 
@@ -570,6 +570,8 @@ function drawCar() {
   ctx.restore();
 }
 
+const formatPoints = points => Math.floor(points).toLocaleString();   // whole points, with thousands separators
+
 function render() {
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.width / dpr, h = canvas.height / dpr;
@@ -585,9 +587,9 @@ function render() {
   const speed = Math.hypot(game.car.vx, game.car.vy);
   hudSpeed.textContent = Math.round(speed * PX_TO_KMH);
   const sc = game.scoring;
-  hudTotal.textContent = Math.floor(sc.total).toLocaleString();
-  hudChain.textContent = sc.pending > 0 ? '+' + Math.floor(sc.pending).toLocaleString() + '  \u00d7' + sc.multiplier : '';
-  hudBest.textContent = 'Best chain ' + Math.floor(sc.bestChain).toLocaleString();
+  hudTotal.textContent = formatPoints(sc.total);
+  hudChain.textContent = sc.pending > 0 ? '+' + formatPoints(sc.pending) + '  \u00d7' + sc.multiplier : '';
+  hudBest.textContent = 'Best chain ' + formatPoints(sc.bestChain);
   hudDrift.textContent = game.car.drifting ? 'DRIFT ' + Math.round(game.car.slipAngle) + '\u00b0' : '';
 }
 

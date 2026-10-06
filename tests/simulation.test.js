@@ -465,6 +465,19 @@ Object.assign(tests, {
     assert.strictEqual(state.scoring.total, 0, 'a lost chain is not banked');
     assert.strictEqual(state.scoring.multiplier, 1);
   },
+  'a Crash deep into a long chain loses it all, and the multiplier starts again at 1'() {
+    const { config, state } = fresh();
+    driftFor(state, config, 3);
+    assert(state.scoring.multiplier >= 2, 'the chain should have built a multiplier');
+    state.circuit = sim.CIRCUIT;
+    placeOnCircuit(state, 20, wallLimit() - 40, Math.PI / 2, config.crashSpeed + 150);
+    run(state, config, idle, 0.3);
+    assert.strictEqual(state.crashCount, 1);
+    assert.strictEqual(state.scoring.total, 0, 'the lost chain is not banked');
+    assert.strictEqual(state.scoring.pending, 0);
+    assert.strictEqual(state.scoring.multiplier, 1);
+    assert.strictEqual(state.scoring.bestChain, 0, 'a lost chain is not a best chain');
+  },
   'a Scrape keeps the chain alive'() {
     const { config, state } = fresh();
     driftFor(state, config, 1);
